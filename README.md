@@ -11,10 +11,10 @@ pip install rich
 
 **Tools in PATH** (Kali/Parrot recommended or Go-installed ProjectDiscovery suite):
 
-**Core (required):**
+**Core:**
 - subfinder
-- httpx
 - naabu
+- ProjectDiscovery **httpx** (not the Python httpx CLI)
 
 **Optional (used if present):**
 - amass
@@ -25,6 +25,18 @@ pip install rich
 - theHarvester
 - nmap
 - nikto
+
+### Important: httpx name collision
+Many systems have the Python `httpx` CLI (from the `httpx` package) which does **not** support `-l` / `-list`.  
+This script detects and requires the **ProjectDiscovery** httpx:
+
+```bash
+go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+# Ensure ~/go/bin comes before the Python httpx in PATH:
+export PATH="$HOME/go/bin:$PATH"
+```
+
+If both exist, the script searches common locations and picks the ProjectDiscovery binary.
 
 ### Quick install (Go)
 ```bash
@@ -42,7 +54,7 @@ Wordlists expected for ffuf (Kali defaults):
 
 ## Usage
 ```bash
-# Basic run
+# Basic run (domains or IPs or mix)
 python3 external_recon_workflow.py -t targets.txt
 
 # Custom rates and output
@@ -53,9 +65,9 @@ python3 external_recon_workflow.py -t targets.txt --skip-ffuf --skip-nikto --ski
 ```
 
 ## Stages
-1. Subdomain enumeration (subfinder + amass, domains only)
-2. DNS resolution (dnsx if available)
-3. Live HTTP discovery (httpx with JSON output, clean URL extraction)
+1. Subdomain enumeration (subfinder + amass) — skipped for pure IP targets
+2. DNS resolution (dnsx if available and hostnames exist)
+3. Live HTTP discovery (ProjectDiscovery httpx, JSON output, clean URL extraction)
 4. Port scanning (naabu top-1000, configurable rate, exclude-CDN)
 4b. HTTP probe on discovered non-standard ports
 5. Nmap aggressive scan (`-A`) on hosts with open ports
@@ -68,9 +80,9 @@ python3 external_recon_workflow.py -t targets.txt --skip-ffuf --skip-nikto --ski
 All raw output lands in a timestamped directory. Final `summary.json` plus a rich summary table.
 
 ## Notes
+- Pure IP targets skip subdomain enumeration and go straight to HTTP probing + port scanning.
 - Rate limits applied where supported. Naabu default is 1000 pps; httpx/nuclei default 50.
-- Nmap uses `-A` (OS detection, version detection, default scripts, traceroute) on hosts that had open ports.
-- No exploitation, no credential attacks, no Metasploit.
-- Review findings manually. Scanner output is a starting point, not a final report.
-- Run only against authorized targets under written rules of engagement.
+- Nmap uses `-A` on hosts that had open ports.
+- No exploitation.
+- Run only against authorized targets.
 - Ctrl+C cleanly exits.

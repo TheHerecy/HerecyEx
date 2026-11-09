@@ -39,7 +39,7 @@ DEFAULT_NAABU_RATE = 1000
 TIMEOUT = 3600
 
 # Core tools — script continues with warnings if some are missing
-CORE_TOOLS = ["subfinder", "httpx", "naabu"]
+CORE_TOOLS = ["subfinder", "naabu"]  # httpx checked separately for PD binary
 OPTIONAL_TOOLS = ["amass", "nuclei", "katana", "ffuf", "theHarvester", "nmap", "nikto", "dnsx"]
 
 def banner():
@@ -54,6 +54,34 @@ def banner():
 
 def log(msg, style="info"):
     console.print(f"[{style}]{msg}[/]")
+
+def find_pd_httpx():
+    """Return path to ProjectDiscovery httpx, or None if only the Python httpx CLI is present."""
+    candidates = []
+    # Common locations
+    for base in [Path.home() / "go" / "bin", Path("/usr/local/bin"), Path("/usr/bin"), Path.home() / ".local" / "bin"]:
+        candidates.append(base / "httpx")
+    # PATH search
+    which = shutil.which("httpx")
+    if which:
+        candidates.append(Path(which))
+    seen = set()
+    for cand in candidates:
+        if not cand or not cand.is_file():
+            continue
+        try:
+            r = subprocess.run([str(cand), "-version"], capture_output=True, text=True, timeout=5)
+            out = (r.stdout + r.stderr).lower()
+            if "projectdiscovery" in out or "httpx version" in out and "go" in out:
+                return str(cand)
+            # Fallback: check help for PD-specific flag
+            r2 = subprocess.run([str(cand), "-h"], capture_output=True, text=True, timeout=5)
+            help_text = (r2.stdout + r2.stderr).lower()
+            if "-list" in help_text or "-l string" in help_text or "rate-limit" in help_text and "tech-detect" in help_text:
+                return str(cand)
+        except Exception:
+            continue
+    return None
 
 def check_tools():
     missing_core = [t for t in CORE_TOOLS if shutil.which(t) is None]
@@ -183,6 +211,20 @@ def main():
 
     check_tools()
 
+    httpx_bin = find_pd_httpx()
+    if not httpx_bin:
+        console.print(Panel(
+            "[error]ProjectDiscovery httpx not found.[/]\n"
+            "The 'httpx' in your PATH appears to be the Python httpx CLI (no -l / -list support).\n\n"
+            "Install the correct one:\n"
+            "  go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest\n"
+            "Then ensure ~/go/bin is before the Python httpx in PATH, or use the full path.",
+            title="httpx Mismatch",
+            border_style="red"
+        ))
+        sys.exit(1)
+    log(f"Using ProjectDiscovery httpx: [bold]{httpx_bin}[/]", "success")
+
     targets = load_targets(targets_path)
     domains = [t for t in targets if is_domain(t)]
     ips = [t for t in targets if not is_domain(t)]
@@ -224,7 +266,7 @@ def main():
     # ---------- Stage 2: DNS Resolution (dnsx) ----------
     resolved_hosts = set(all_subs)
     resolved_ips = set(ips)
-    if shutil.which("dnsx") and all_subs:
+    if shutil.which("dnsx") and (all_subs or domains):
         stage_header(2, "DNS Resolution (dnsx)")
         dnsx_out = outdir / "02_dnsx.txt"
         run_cmd(["dnsx", "-l", str(subs_file), "-silent", "-a", "-resp", "-o", str(dnsx_out)])
@@ -240,7 +282,10 @@ def main():
                         resolved_ips.add(ip_part)
         log(f"Resolved hosts: {len(resolved_hosts)} | Unique IPs: {len(resolved_ips)}", "success")
     else:
-        log("dnsx not available — skipping explicit resolution (naabu/httpx will resolve).", "warning")
+        if not shutil.which("dnsx"):
+            log("dnsx not in PATH — skipping explicit resolution (naabu/httpx will resolve).", "warning")
+        else:
+            log("No hostnames to resolve with dnsx.", "warning")
 
     # ---------- Stage 3: Live HTTP Discovery (httpx) ----------
     stage_header(3, "Live HTTP Host Discovery")
@@ -250,7 +295,7 @@ def main():
 
     httpx_out = outdir / "03_httpx.jsonl"
     run_cmd([
-        "httpx", "-l", str(probe_file),
+        httpx_bin, "-l", str(probe_file),
         "-silent", "-json",
         "-status-code", "-title", "-tech-detect", "-web-server",
         "-follow-redirects", "-rate-limit", str(args.http_rate),
@@ -289,7 +334,7 @@ def main():
 
     # ---------- Stage 4b: Probe discovered non-standard ports with httpx ----------
     extra_urls = []
-    if open_ports and shutil.which("httpx"):
+    if open_ports and httpx_bin:
         stage_header("4b", "HTTP Probe on Discovered Ports")
         # Build host:port list for non-80/443 (and always include originals)
         extra_targets = [p for p in open_ports if not p.endswith(":80") and not p.endswith(":443")]
@@ -298,7 +343,7 @@ def main():
             extra_file.write_text("\n".join(extra_targets) + "\n")
             extra_httpx = outdir / "04b_httpx_extra.jsonl"
             run_cmd([
-                "httpx", "-l", str(extra_file),
+                httpx_bin, "-l", str(extra_file),
                 "-silent", "-json",
                 "-status-code", "-title", "-tech-detect",
                 "-follow-redirects", "-rate-limit", str(args.http_rate),
