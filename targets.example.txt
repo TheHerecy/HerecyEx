@@ -1,0 +1,5 @@
+# Sample targets file for external recon workflow
+# One domain or IP per line. Lines starting with # are ignored.
+example.com
+scanme.nmap.org
+# 192.0.2.1
