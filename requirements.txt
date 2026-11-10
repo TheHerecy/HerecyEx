@@ -114,9 +114,15 @@ dnspython>=2.6.0
 #   # Used only when root or passwordless sudo is available, at a conservative
 #   # --rate 500 suitable for authorized external work.
 #
-# --- 5. testssl.sh / ssh-audit / enum4linux-ng (git / pipx fallbacks) -------
-# Kali apt usually has these; fallbacks if a package is missing:
+# --- 5. testssl.sh / ssh-audit / enum4linux-ng (apt, then git / pipx) ------
+# Kali apt already ships testssl.sh 3.2.x. The package installs the binary as
+# /usr/bin/testssl (no .sh suffix). HerecyEx accepts either name. Do not clone
+# upstream when that package is installed.
 #
+#   sudo apt install -y testssl.sh
+#   command -v testssl || command -v testssl.sh
+#
+# Git checkout only if the distro package is absent:
 #   git clone --depth 1 https://github.com/drwetter/testssl.sh.git "$HOME/testssl.sh"
 #   ln -sf "$HOME/testssl.sh/testssl.sh" "$HOME/.local/bin/testssl.sh"
 #   chmod +x "$HOME/testssl.sh/testssl.sh"

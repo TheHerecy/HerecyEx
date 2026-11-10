@@ -36,7 +36,7 @@ from typing import Any, Iterable, Optional
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 __author__ = "Blackbox Intelligence Group LLC"
 __tool__ = "HerecyEx"
 
@@ -437,7 +437,13 @@ TOOLS: list[Tool] = [
     Tool("gowitness", "gowitness", "go install github.com/sensepost/gowitness@latest", ("web",)),
     Tool("eyewitness", "eyewitness", "sudo apt install eyewitness", ("web",)),
     Tool("sslscan", "sslscan", "sudo apt install sslscan", ("web",)),
-    Tool("testssl", "testssl.sh", "git clone https://github.com/drwetter/testssl.sh.git", ("web",),),
+    Tool(
+        "testssl",
+        "testssl.sh",
+        "sudo apt install testssl.sh  # Kali installs the binary as testssl, not testssl.sh",
+        ("web",),
+        alt_binaries=("testssl",),
+    ),
     Tool("tlsx", "tlsx", "go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest", ("web",)),
     Tool("gau", "gau", "go install github.com/lc/gau/v2/cmd/gau@latest", ("passive",)),
     Tool("waybackurls", "waybackurls", "go install github.com/tomnomnom/waybackurls@latest", ("passive",)),
@@ -477,8 +483,12 @@ def which(binary: str) -> Optional[str]:
         f"/opt/{binary}/{binary}",
     ]
     if binary in {"testssl.sh", "testssl"}:
+        # Kali's testssl.sh package installs /usr/bin/testssl (no .sh).
+        # Upstream git checkouts keep the testssl.sh name. Either is accepted.
         extras.extend(
             [
+                "/usr/bin/testssl",
+                "/usr/local/bin/testssl",
                 "/usr/bin/testssl.sh",
                 "/usr/local/bin/testssl.sh",
                 os.path.expanduser("~/testssl.sh/testssl.sh"),
@@ -944,6 +954,13 @@ class TargetSet:
     cidrs: list[str] = field(default_factory=list)
     dropped: list[str] = field(default_factory=list)
     raw: list[str] = field(default_factory=list)
+    # Seeds are the operator's original list. Passive discovery must not widen them.
+    seed_domains: list[str] = field(default_factory=list)
+    seed_ips: list[str] = field(default_factory=list)
+    seed_networks: list = field(default_factory=list)
+    active_names: list[str] = field(default_factory=list)
+    candidates: list[str] = field(default_factory=list)
+    scope_decisions: list = field(default_factory=list)
 
     def all_hosts(self) -> list[str]:
         return unique(list(self.domains) + list(self.ips))
@@ -1008,6 +1025,397 @@ def in_scope(value: str, nets: list[ipaddress._BaseNetwork], domain_suffixes: li
         if v == sfx or v.endswith("." + sfx):
             return True
     return False
+
+
+def capture_seeds(ts: TargetSet) -> None:
+    """Remember the operator's original names, addresses, and ranges."""
+    ts.seed_domains = list(ts.domains)
+    ts.seed_ips = list(ts.ips)
+    nets: list[ipaddress._BaseNetwork] = []
+    for cidr in ts.cidrs:
+        net = parse_network(cidr)
+        if net is not None:
+            nets.append(net)
+    for ip in ts.seed_ips:
+        if is_ip(ip):
+            nets.append(ipaddress.ip_network(ip, strict=False))
+    ts.seed_networks = nets
+
+
+def ip_in_seed_networks(ip: str, targets: TargetSet) -> bool:
+    if not is_ip(ip):
+        return False
+    addr = ipaddress.ip_address(ip)
+    return any(addr in net for net in targets.seed_networks)
+
+
+def ip_allowed(ip: str, cfg: "Config", targets: TargetSet) -> bool:
+    """True only when this address may be actively probed."""
+    if not is_ip(ip):
+        return False
+    if getattr(cfg, "scope_enforced", False):
+        # An allowlist with only domain suffixes cannot prove an address.
+        if not cfg.scope_nets:
+            return False
+        return bool(in_scope(ip, cfg.scope_nets, []))
+    if targets.seed_networks:
+        # Any IP/CIDR in the original list becomes the ceiling when no allowlist was given.
+        return ip_in_seed_networks(ip, targets)
+    # Domain-only list and no --scope-check: the operator named the names.
+    return bool(targets.seed_domains)
+
+
+def name_may_be_probed(name: str, ips: Iterable[str], cfg: "Config", targets: TargetSet) -> tuple[bool, str]:
+    """A hostname is probed only when every resolved address is allowed.
+
+    Unresolved names and mixed in-scope/out-of-scope answers fail closed.
+    The name is still kept as a candidate either way.
+    """
+    resolved = [ip for ip in ips if is_ip(ip)]
+    if getattr(cfg, "scope_enforced", False):
+        if not cfg.scope_nets:
+            return False, "allowlist has no networks, so resolved addresses cannot be proven in scope"
+        if not resolved:
+            return False, "unresolved under --scope-check"
+        outside = [ip for ip in resolved if not ip_allowed(ip, cfg, targets)]
+        if outside:
+            return False, "not every resolved IP is in the allowlist: " + ", ".join(outside)
+        return True, "every resolved IP is in the allowlist"
+    if targets.seed_networks:
+        if not resolved:
+            return False, "unresolved; IP/CIDR targets fail closed without --scope-check"
+        outside = [ip for ip in resolved if not ip_in_seed_networks(ip, targets)]
+        if outside:
+            return False, "resolved outside the initial target IP/CIDR set: " + ", ".join(outside)
+        return True, "every resolved IP is inside the initial target IP/CIDR set"
+    if targets.seed_domains:
+        return True, "no --scope-check and the target list is domain-only; the operator owns that list"
+    return False, "no seed names, no seed ranges, and no --scope-check"
+
+
+def apply_resolution_scope(
+    cfg: "Config",
+    targets: TargetSet,
+    resolved: dict[str, list[str]],
+    state: Optional["RunState"] = None,
+) -> None:
+    """Split names into active vs candidate and drop addresses that must not be probed."""
+    names = unique(list(targets.domains) + list(resolved.keys()))
+    decisions = []
+    active: list[str] = []
+    candidates: list[str] = []
+    allowed_from_dns: list[str] = []
+    for name in names:
+        if not is_domain(name):
+            continue
+        ips = list(resolved.get(name) or resolved.get(name.lower()) or [])
+        ok, reason = name_may_be_probed(name, ips, cfg, targets)
+        decisions.append({"name": name, "ips": ips, "active": ok, "reason": reason})
+        if ok:
+            active.append(name)
+        else:
+            candidates.append(name)
+        for ip in ips:
+            if ip_allowed(ip, cfg, targets):
+                allowed_from_dns.append(ip)
+        if state is not None and is_domain(name):
+            hr = state.host(name, kind="domain")
+            hr.ips = [ip for ip in ips if ip_allowed(ip, cfg, targets)]
+            for ip in hr.ips:
+                ip_rec = state.host(ip, kind="ip")
+                if name not in ip_rec.names:
+                    ip_rec.names.append(name)
+    kept_ips: list[str] = []
+    for ip in list(targets.seed_ips) + list(targets.ips) + allowed_from_dns:
+        if ip_allowed(ip, cfg, targets) and ip not in kept_ips:
+            kept_ips.append(ip)
+    targets.ips = kept_ips
+    targets.active_names = active
+    targets.candidates = candidates
+    targets.scope_decisions = decisions
+    try:
+        base = cfg.outdir / "resolve"
+        base.mkdir(parents=True, exist_ok=True)
+        write_text(base / "scope-decisions.json", json.dumps(decisions, indent=2))
+        write_lines(cfg.outdir / "targets" / "candidates.txt", candidates)
+        write_lines(cfg.outdir / "targets" / "active-names.txt", active)
+    except Exception as exc:
+        log_warn(f"Could not write scope decisions: {exc}")
+    log_info(
+        f"Scope: {len(active)} name(s) eligible for active probes, "
+        f"{len(candidates)} kept as candidates only"
+    )
+
+
+def split_host_token(token: str) -> str:
+    """Hostname or address from a URL, host, or host:port token."""
+    text = token.strip()
+    text = re.sub(r"^https?://", "", text, flags=re.I)
+    text = text.split("/")[0].strip()
+    if text.startswith("["):
+        return text[1:].split("]")[0]
+    if text.count(":") == 1 and not is_ipv6(text):
+        return text.split(":")[0]
+    return text
+
+
+def url_host_allowed(token: str, cfg: "Config", targets: TargetSet) -> bool:
+    host = split_host_token(token).rstrip(".").lower()
+    if not host:
+        return False
+    if is_ip(host):
+        return ip_allowed(host, cfg, targets)
+    return host in {n.lower() for n in targets.active_names}
+
+
+def filter_probe_tokens(tokens: Iterable[str], cfg: "Config", targets: TargetSet) -> list[str]:
+    """Drop every token whose host is not eligible for an active probe."""
+    return [tok for tok in unique(tokens) if url_host_allowed(tok, cfg, targets)]
+
+
+def portscan_targets(cfg: "Config", targets: TargetSet) -> list[str]:
+    """IP addresses only. Names are never handed to a port scanner."""
+    return [ip for ip in unique(targets.ips) if ip_allowed(ip, cfg, targets)]
+
+
+def axfr_server_ips(ns_label: str, resolved_ips: Iterable[str], cfg: "Config", targets: TargetSet) -> list[str]:
+    """Addresses that may receive AXFR. A hostname is never returned.
+
+    Third-party name servers are skipped even when the zone name is in scope.
+    """
+    ips: list[str] = []
+    if is_ip(ns_label):
+        ips.append(ns_label)
+    for ip in resolved_ips:
+        if is_ip(ip):
+            ips.append(ip)
+    return [ip for ip in unique(ips) if ip_allowed(ip, cfg, targets)]
+
+
+def axfr_commands(zone: str, ns_label: str, ns_ips: Iterable[str], cfg: "Config", targets: TargetSet) -> list[list[str]]:
+    """dig AXFR argv list. Empty when the server is not in scope."""
+    dig = "dig"
+    cmds = []
+    for ip in axfr_server_ips(ns_label, ns_ips, cfg, targets):
+        cmds.append([dig, f"@{ip}", zone, "AXFR", "+time=8", "+tries=1"])
+    return cmds
+
+
+def consider_redirect(location: str, cfg: "Config", targets: TargetSet) -> bool:
+    """Whether a Location/final URL may itself be probed. Off-scope hosts never may."""
+    if not location or not str(location).strip():
+        return False
+    return url_host_allowed(str(location), cfg, targets)
+
+
+# Child tools that follow redirects onto other hosts and cannot be given a scope pin.
+# They are not started. This is a limit of those tools, not something HerecyEx can patch inside them.
+REDIRECT_UNSCOPED_TOOLS = {
+    "katana": (
+        "Katana follows HTTP redirects in its client before crawl-scope filtering. "
+        "A 3xx to another host is requested. Katana is not started."
+    ),
+    "gowitness": (
+        "gowitness drives a browser, and the browser follows redirects to any host. "
+        "Screenshots are not taken."
+    ),
+    "eyewitness": (
+        "EyeWitness drives a browser that follows redirects off-host. Screenshots are not taken."
+    ),
+    "nikto": (
+        "Nikto follows 3xx responses and has no switch that pins the next request to the scoped host. "
+        "Nikto is not started, including when --nikto was passed."
+    ),
+}
+
+
+def httpx_probe_args(binary: str, infile: Path, json_out: Path, cfg: "Config") -> list[str]:
+    """httpx argv. Redirects are not followed; -location only records the header."""
+    return [
+        binary, "-l", str(infile), "-silent", "-json",
+        "-title", "-tech-detect", "-status-code", "-web-server",
+        "-content-type", "-location", "-no-color",
+        "-timeout", "8", "-rate-limit", str(cfg.http_rate),
+        "-threads", str(min(50, max(10, cfg.threads * 2))),
+        "-o", str(json_out),
+    ]
+
+
+def nuclei_probe_args(binary: str, urlfile: Path, json_out: Path, cfg: "Config") -> list[str]:
+    """nuclei argv. JSONL output, redirects forced off, interactsh off.
+
+    Per-template `redirects: true` is overridden by -disable-redirects in current
+    nuclei. Templates can still issue their own requests to other URLs; that
+    cannot be prevented from the CLI. See README.
+    """
+    severity = cfg.nuclei_severity or (
+        "high,critical" if cfg.profile == "quick" else "info,low,medium,high,critical"
+    )
+    return [
+        binary,
+        "-l", str(urlfile),
+        "-severity", severity,
+        "-exclude-tags", NUCLEI_EXCLUDED_TAGS,
+        "-disable-redirects",
+        "-no-interactsh",
+        "-rl", str(cfg.http_rate),
+        "-c", str(min(25, max(5, cfg.threads))),
+        "-timeout", "10",
+        "-retries", "1",
+        "-jsonl",
+        "-o", str(json_out),
+        "-silent",
+        "-no-color",
+    ]
+
+
+def whatweb_args(binary: str, url: str, cfg: "Config") -> list[str]:
+    aggression = "3" if cfg.profile == "full" else "1"
+    return [binary, "--color=never", "--follow-redirect=never", "-a", aggression, url]
+
+
+def wafw00f_args(binary: str, url: str) -> list[str]:
+    # -r / --noredirect: do not request the Location target.
+    return [binary, "-a", "-r", url]
+
+
+def ferox_args(binary: str, url: str, wordlist: Path, outfile: Path, cfg: "Config") -> list[str]:
+    threads = 10 if cfg.profile == "full" else 8
+    return [
+        binary, "-u", url, "-w", str(wordlist),
+        "-t", str(threads), "-n", "--quiet", "--no-state",
+        "-C", "404,400,429,501",
+        "--rate-limit", str(min(30, cfg.http_rate)),
+        "-d", "0",
+        "-o", str(outfile),
+    ]
+
+
+def gobuster_args(binary: str, url: str, wordlist: Path, outfile: Path, cfg: "Config") -> list[str]:
+    threads = 10 if cfg.profile == "full" else 8
+    return [
+        binary, "dir", "-u", url, "-w", str(wordlist),
+        "-t", str(threads), "-q", "-k",
+        "--timeout", "8s",
+        "-o", str(outfile),
+    ]
+
+
+def ffuf_args(binary: str, url: str, wordlist: Path, outfile: Path, cfg: "Config") -> list[str]:
+    threads = 10 if cfg.profile == "full" else 8
+    return [
+        binary,
+        "-u", url.rstrip("/") + "/FUZZ",
+        "-w", str(wordlist),
+        "-t", str(threads),
+        "-rate", str(min(30, cfg.http_rate)),
+        "-mc", "200,204,301,302,307,401,403",
+        "-of", "json",
+        "-o", str(outfile),
+        "-s",
+    ]
+
+
+def nmap_service_cmd(
+    cfg: "Config",
+    prefix: list[str],
+    sflag: str,
+    dest: Path,
+    hostfile: Path,
+    *,
+    ports: Optional[str] = None,
+    top_ports: Optional[int] = None,
+) -> list[str]:
+    """Version detection only. No -sC.
+
+    ``-sC`` is ``--script=default``. That set is whatever the installed nmap
+    calls default, and individual scripts can override the HTTP library's
+    redirect check. HerecyEx does not treat the category name as a scope boundary.
+    """
+    cmd = list(prefix) + [sflag, "-Pn", "-n", f"-T{cfg.nmap_timing}"]
+    if ports:
+        cmd += ["-p", ports]
+    elif top_ports:
+        cmd += ["--top-ports", str(top_ports)]
+    cmd += ["-sV", "--version-intensity", "5", "-oA", str(dest), "-iL", str(hostfile)]
+    return cmd + list(cfg.extra_nmap)
+
+
+def intrusive_checks_enabled(cfg: "Config") -> bool:
+    """Open-relay and empty-password NSE run only with both switches."""
+    return bool(getattr(cfg, "allow_intrusive_checks", False) and getattr(cfg, "authorized", False))
+
+
+SMTP_SINGLE_PROBE = "herecyex-probe"
+
+
+def smtp_scripts(cfg: "Config") -> str:
+    """Default is smtp-commands only.
+
+    ``smtp-vrfy`` is not an Nmap NSE script (the nsedoc page is 404). Requesting
+    it makes nmap abort the whole SMTP script set. ``smtp-enum-users`` is in the
+    intrusive category and walks a username database unless it is pinned; it is
+    not used unless the operator opted in.
+    """
+    parts = ["smtp-commands"]
+    if intrusive_checks_enabled(cfg):
+        parts.extend(["smtp-enum-users", "smtp-open-relay"])
+    return ",".join(parts)
+
+
+def smtp_script_args(probe_file: Path) -> str:
+    """One VRFY of a single dummy name. No RCPT, no EXPN, no user list."""
+    return (
+        "smtp-enum-users.methods={VRFY},"
+        f"userdb={probe_file},"
+        "unpwdb.userlimit=1"
+    )
+
+
+def mssql_scripts(cfg: "Config") -> str:
+    base = "ms-sql-info,ms-sql-ntlm-info"
+    if intrusive_checks_enabled(cfg):
+        return base + ",ms-sql-empty-password"
+    return base
+
+
+def mysql_scripts(cfg: "Config") -> str:
+    base = "mysql-info"
+    if intrusive_checks_enabled(cfg):
+        return base + ",mysql-empty-password"
+    return base
+
+
+def parse_nuclei_records(path: Path) -> list[dict[str, Any]]:
+    """Read nuclei JSONL or a JSON array. Empty and missing files yield nothing."""
+    if not path.exists() or path.stat().st_size == 0:
+        return []
+    text = path.read_text(encoding="utf-8", errors="replace").strip()
+    if not text:
+        return []
+    if text[0] in "[{":
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict):
+            return [data]
+        if isinstance(data, list):
+            return [row for row in data if isinstance(row, dict)]
+    records: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip().rstrip(",")
+        if not line or line in {"[", "]"}:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            records.append(row)
+        elif isinstance(row, list):
+            records.extend(item for item in row if isinstance(item, dict))
+    return records
 
 
 def parse_targets(
@@ -1084,6 +1492,7 @@ def parse_targets(
     ts.domains = unique(ts.domains)
     ts.ips = unique(ts.ips)
     ts.dropped = unique(ts.dropped)
+    capture_seeds(ts)
     return ts
 
 
@@ -1322,6 +1731,9 @@ class Config:
     alive_only: bool
     http_rate: int = 50
     naabu_rate: int = 1000
+    allow_intrusive_checks: bool = False
+    authorized: bool = False
+    scope_enforced: bool = False
     scope_nets: list = field(default_factory=list)
     scope_suffixes: list = field(default_factory=list)
     extra_nmap: list[str] = field(default_factory=list)
@@ -1695,17 +2107,11 @@ def phase_passive(cfg: Config, state: RunState, targets: TargetSet) -> None:
                     discovered.extend(_collect_hostnames_from_text(cand.read_text(encoding="utf-8", errors="replace"), apex))
             discovered.extend(_collect_hostnames_from_text((ddir / "theharvester.log").read_text(encoding="utf-8", errors="replace") if (ddir / "theharvester.log").exists() else "", apex))
 
-        # dnsrecon standard (SOA/NS/MX/AXFR attempt) — skip in --no-active because AXFR is active
-        bin_dr = cfg.tools.path("dnsrecon")
-        if bin_dr and not cfg.no_active:
-            run_cmd(
-                [bin_dr, "-d", apex, "-t", "std"],
-                outfile=ddir / "dnsrecon.txt",
-                timeout=max(cfg.timeout, 180),
-                skip_if_exists=cfg.skip_if_exists,
-            )
-            if (ddir / "dnsrecon.txt").exists():
-                discovered.extend(_collect_hostnames_from_text((ddir / "dnsrecon.txt").read_text(encoding="utf-8", errors="replace"), apex))
+        # dnsrecon -t std also attempts AXFR against the zone's NS hosts.
+        # Those servers are often a third-party DNS provider. AXFR is done
+        # later, and only to name-server addresses that are in scope.
+        if cfg.tools.path("dnsrecon"):
+            log_info(f"{apex}: not running dnsrecon -t std (it attempts AXFR before the NS address is scope-checked)")
 
         # gau / waybackurls (passive URL discovery)
         for tool, args in (
@@ -1811,24 +2217,10 @@ def phase_resolve(cfg: Config, state: RunState, targets: TargetSet) -> None:
     if domains:
         resolved = resolve_domains(cfg, base, domains)
 
-    # Apply scope to newly resolved IPs
-    for name, ips in resolved.items():
-        hr = state.host(name, kind="domain")
-        for ip in ips:
-            if cfg.scope_nets and not in_scope(ip, cfg.scope_nets, cfg.scope_suffixes):
-                log_info(f"Resolved {name} -> {ip} is out of scope; dropping IP")
-                continue
-            if ip not in hr.ips:
-                hr.ips.append(ip)
-            targets.add_ip(ip)
-            ip_rec = state.host(ip, kind="ip")
-            if name not in ip_rec.names:
-                ip_rec.names.append(name)
-
-    targets.ips = unique(targets.ips)
+    apply_resolution_scope(cfg, targets, resolved, state)
     write_lines(base / "resolved-ips.txt", targets.ips)
     write_text(base / "resolved.json", json.dumps(resolved, indent=2))
-    log_ok(f"Resolved {sum(1 for v in resolved.values() if v)} name(s) to {len(targets.ips)} IP(s)")
+    log_ok(f"Resolved {sum(1 for v in resolved.values() if v)} name(s) to {len(targets.ips)} in-scope IP(s)")
 
     # Liveness — ICMP/TCP ping is informational. External hosts often drop ICMP,
     # so we still carry every in-scope IP into the port-scan phase unless
@@ -1846,9 +2238,13 @@ def phase_resolve(cfg: Config, state: RunState, targets: TargetSet) -> None:
     elif cfg.no_active:
         log_info("--no-active: skipping ICMP/TCP liveness and httpx")
 
-    # Light httpx pass so later phases know which names/IPs speak HTTP
-    if not cfg.no_active and (domains or targets.ips):
-        probe_httpx(cfg, state, base / "httpx-live", unique(domains + targets.ips))
+    # httpx only sees names whose every address was allowed, plus those addresses.
+    if not cfg.no_active:
+        probe_hosts = filter_probe_tokens(list(targets.active_names) + list(targets.ips), cfg, targets)
+        if probe_hosts:
+            probe_httpx(cfg, state, targets, base / "httpx-live", probe_hosts)
+        else:
+            log_info("No in-scope hosts for httpx")
 
     write_lines(cfg.outdir / "targets" / "ips-after-resolve.txt", targets.ips)
     state.save()
@@ -1982,7 +2378,7 @@ def probe_liveness(cfg: Config, base: Path, ips: list[str]) -> list[str]:
     return unique(alive)
 
 
-def probe_httpx(cfg: Config, state: RunState, dest: Path, hosts: list[str]) -> list[dict[str, Any]]:
+def probe_httpx(cfg: Config, state: RunState, targets: TargetSet, dest: Path, hosts: list[str]) -> list[dict[str, Any]]:
     dest.parent.mkdir(parents=True, exist_ok=True)
     infile = dest.with_suffix(".in.txt")
     write_lines(infile, hosts)
@@ -1993,15 +2389,7 @@ def probe_httpx(cfg: Config, state: RunState, dest: Path, hosts: list[str]) -> l
         return records
 
     json_out = dest.with_suffix(".json")
-    cmd = [
-        bin_httpx, "-l", str(infile), "-silent", "-json",
-        "-title", "-tech-detect", "-status-code", "-web-server",
-        "-content-type", "-follow-redirects", "-no-color",
-        "-timeout", "8", "-rate-limit", str(cfg.http_rate),
-        "-threads", str(min(50, max(10, cfg.threads * 2))),
-        "-o", str(json_out),
-    ]
-    # TLS details when supported; older httpx uses -tls-grab / -tls-probe
+    cmd = httpx_probe_args(bin_httpx, infile, json_out, cfg)
     run_cmd(cmd, outfile=dest.with_suffix(".log"), timeout=max(cfg.timeout, 600), skip_if_exists=cfg.skip_if_exists)
     if not json_out.exists():
         return records
@@ -2015,6 +2403,18 @@ def probe_httpx(cfg: Config, state: RunState, dest: Path, hosts: list[str]) -> l
             continue
         records.append(rec)
         url = rec.get("url") or rec.get("input") or ""
+        location = rec.get("location") or rec.get("final_url") or ""
+        if location and not consider_redirect(str(location), cfg, targets):
+            # The header is evidence. It is not a new probe target.
+            targets.scope_decisions.append({
+                "name": split_host_token(str(location)).lower(),
+                "ips": [],
+                "active": False,
+                "reason": f"redirect Location from {url or rec.get('input')} was not probed: {location}",
+            })
+            log_info(f"Not following redirect from {url or rec.get('input')} to {location}")
+        if not url_host_allowed(str(url or rec.get("input") or ""), cfg, targets):
+            continue
         host = rec.get("host") or rec.get("input") or ""
         # strip scheme/port for the host key
         key = host
@@ -2058,14 +2458,14 @@ def phase_ports(cfg: Config, state: RunState, targets: TargetSet) -> None:
     if cfg.no_active:
         log_info("--no-active: skipping port scans")
         return
-    ips = unique(targets.ips)
+    ips = portscan_targets(cfg, targets)
     if not ips:
-        # Fall back to unresolved domain names (nmap will resolve)
-        ips = unique(targets.domains)
-        if not ips:
-            log_info("No IPs or names to scan")
-            return
-        log_warn("No resolved IPs; passing domain names directly to the port scanner")
+        log_warn(
+            "No in-scope IP addresses to port-scan. "
+            "Hostnames are not sent to naabu, rustscan, masscan, or nmap."
+        )
+        state.save()
+        return
 
     base = cfg.outdir / "ports"
     base.mkdir(parents=True, exist_ok=True)
@@ -2078,7 +2478,7 @@ def phase_ports(cfg: Config, state: RunState, targets: TargetSet) -> None:
     for host, ports in frontend_ports.items():
         discovered[host].update(ports)
 
-    # Always confirm with nmap -sV -sC on discovered ports (or a top-ports nmap if frontend found nothing)
+    # Confirm with nmap -sV only. -sC is not used; see nmap_service_cmd.
     confirm_nmap(cfg, state, base, ips, discovered)
 
     if cfg.full_ports and not should_stop():
@@ -2209,13 +2609,9 @@ def confirm_nmap(cfg: Config, state: RunState, base: Path, ips: list[str], disco
     # Otherwise a single top-ports version/script scan.
     if not any(discovered.values()):
         out = outdir / "top-ports"
-        cmd = prefix + [
-            sflag, "-Pn", "-n", f"-T{cfg.nmap_timing}",
-            "--top-ports", str(cfg.top_ports),
-            "-sV", "-sC", "--version-intensity", "5",
-            "-oA", str(out),
-            "-iL", str(base / "scan-targets.txt"),
-        ] + cfg.extra_nmap
+        cmd = nmap_service_cmd(
+            cfg, prefix, sflag, out, base / "scan-targets.txt", top_ports=cfg.top_ports,
+        )
         run_cmd(cmd, outfile=outdir / "top-ports.log", timeout=cfg.port_timeout, skip_if_exists=cfg.skip_if_exists)
         ingest_nmap(state, Path(str(out) + ".xml"))
         return
@@ -2241,12 +2637,7 @@ def confirm_nmap(cfg: Config, state: RunState, base: Path, ips: list[str], disco
         hostfile = Path(str(dest) + ".hosts")
         write_lines(hostfile, hosts)
         port_str = ",".join(str(p) for p in ports)
-        cmd = prefix + [
-            sflag, "-Pn", "-n", f"-T{cfg.nmap_timing}",
-            "-p", port_str, "-sV", "-sC", "--version-intensity", "5",
-            "-oA", str(dest),
-            "-iL", str(hostfile),
-        ] + cfg.extra_nmap
+        cmd = nmap_service_cmd(cfg, prefix, sflag, dest, hostfile, ports=port_str)
         run_cmd(cmd, outfile=Path(str(dest) + ".log"), timeout=cfg.port_timeout, skip_if_exists=cfg.skip_if_exists)
         ingest_nmap(state, Path(str(dest) + ".xml"))
 
@@ -2256,13 +2647,9 @@ def confirm_nmap(cfg: Config, state: RunState, base: Path, ips: list[str], disco
         dest = outdir / "no-frontend-ports"
         hostfile = Path(str(dest) + ".hosts")
         write_lines(hostfile, unscanned)
-        cmd = prefix + [
-            sflag, "-Pn", "-n", f"-T{cfg.nmap_timing}",
-            "--top-ports", str(cfg.top_ports),
-            "-sV", "-sC", "--version-intensity", "5",
-            "-oA", str(dest),
-            "-iL", str(hostfile),
-        ] + cfg.extra_nmap
+        cmd = nmap_service_cmd(
+            cfg, prefix, sflag, dest, hostfile, top_ports=cfg.top_ports,
+        )
         run_cmd(cmd, outfile=Path(str(dest) + ".log"), timeout=cfg.port_timeout, skip_if_exists=cfg.skip_if_exists)
         ingest_nmap(state, Path(str(dest) + ".xml"))
 
@@ -2317,7 +2704,7 @@ def open_ports_for(hr: HostRecord, proto: str = "tcp") -> set[int]:
     return {int(p["port"]) for p in bucket if p.get("port") is not None}
 
 
-def web_endpoints(state: RunState, targets: TargetSet) -> list[str]:
+def web_endpoints(state: RunState, targets: TargetSet, cfg: Optional[Config] = None) -> list[str]:
     """Build a de-duplicated list of URLs / hosts to feed web tools."""
     urls: list[str] = []
     seen = set()
@@ -2358,10 +2745,11 @@ def web_endpoints(state: RunState, targets: TargetSet) -> list[str]:
             # No port data yet — still try 80/443 via httpx if we didn't already
             pass
 
-    # Always include discovered live httpx URLs and bare names for a second pass
-    for name in unique(list(targets.domains) + list(targets.ips)):
+    for name in unique(list(targets.active_names) + list(targets.ips)):
         add(name)
-    return urls
+    if cfg is None:
+        return urls
+    return filter_probe_tokens(urls, cfg, targets)
 
 
 def phase_web(cfg: Config, state: RunState, targets: TargetSet) -> None:
@@ -2373,28 +2761,49 @@ def phase_web(cfg: Config, state: RunState, targets: TargetSet) -> None:
     base = cfg.outdir / "web"
     base.mkdir(parents=True, exist_ok=True)
 
-    # Refresh / expand httpx coverage using discovered web ports
-    hosts_for_httpx = unique(list(targets.domains) + list(targets.ips) + list(state.subdomains))
-    # Include host:port forms for non-default web ports
-    extra = []
+    if not targets.scope_decisions:
+        resolved: dict[str, list[str]] = {}
+        resolved_path = cfg.outdir / "resolve" / "resolved.json"
+        if resolved_path.exists():
+            try:
+                loaded = json.loads(resolved_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    resolved = {str(k): list(v or []) for k, v in loaded.items()}
+            except Exception as exc:
+                log_warn(f"Could not reload resolved.json: {exc}")
+        apply_resolution_scope(cfg, targets, resolved, state)
+
+    hosts_for_httpx = list(targets.active_names) + list(targets.ips)
     for hr in state.hosts.values():
         ports = open_ports_for(hr)
         for p in sorted(ports & WEB_PORTS):
             if p in {80, 443}:
                 continue
-            for key in unique([hr.target] + hr.ips + hr.names):
-                extra.append(f"{key}:{p}")
-    hosts_for_httpx = unique(hosts_for_httpx + extra)
+            for key in unique(hr.ips + ([hr.target] if is_ip(hr.target) else [])):
+                hosts_for_httpx.append(f"{key}:{p}")
+    hosts_for_httpx = filter_probe_tokens(hosts_for_httpx, cfg, targets)
     write_lines(base / "httpx-input.txt", hosts_for_httpx)
-    probe_httpx(cfg, state, base / "httpx", hosts_for_httpx)
+    if hosts_for_httpx:
+        probe_httpx(cfg, state, targets, base / "httpx", hosts_for_httpx)
 
-    live_urls = unique(
-        w.get("url")
-        for hr in state.hosts.values()
-        for w in hr.web
-        if w.get("url")
+    live_urls = filter_probe_tokens(
+        (
+            w.get("url")
+            for hr in state.hosts.values()
+            for w in hr.web
+            if w.get("url")
+        ),
+        cfg,
+        targets,
     )
     write_lines(base / "live-urls.txt", live_urls)
+    for tool, reason in REDIRECT_UNSCOPED_TOOLS.items():
+        if tool == "nikto" and not cfg.nikto:
+            continue
+        if tool == "katana" and cfg.profile != "full":
+            continue
+        if cfg.tools.path(tool) or (tool == "nikto" and cfg.nikto):
+            log_warn(reason)
     if not live_urls:
         log_info("No live web endpoints discovered")
         state.save()
@@ -2409,16 +2818,18 @@ def phase_web(cfg: Config, state: RunState, targets: TargetSet) -> None:
         udir = base / "hosts" / safe_name(re.sub(r"^https?://", "", url))
         udir.mkdir(parents=True, exist_ok=True)
 
+        if not url_host_allowed(url, cfg, targets):
+            return
         if cfg.tools.path("whatweb"):
             run_cmd(
-                [cfg.tools.path("whatweb"), "--color=never", "-a", "3" if cfg.profile == "full" else "1", url],
+                whatweb_args(cfg.tools.path("whatweb"), url, cfg),
                 outfile=udir / "whatweb.txt",
                 timeout=min(cfg.timeout, 120),
                 skip_if_exists=cfg.skip_if_exists,
             )
         if cfg.tools.path("wafw00f"):
             run_cmd(
-                [cfg.tools.path("wafw00f"), "-a", url],
+                wafw00f_args(cfg.tools.path("wafw00f"), url),
                 outfile=udir / "wafw00f.txt",
                 timeout=min(cfg.timeout, 90),
                 skip_if_exists=cfg.skip_if_exists,
@@ -2429,25 +2840,8 @@ def phase_web(cfg: Config, state: RunState, targets: TargetSet) -> None:
         if is_https:
             tls_enum(cfg, state, url, udir)
 
-        if cfg.nikto and cfg.tools.path("nikto"):
-            run_cmd(
-                [cfg.tools.path("nikto"), "-h", url, "-ask", "no", "-nointeractive"],
-                outfile=udir / "nikto.txt",
-                timeout=max(cfg.timeout, 600),
-                skip_if_exists=cfg.skip_if_exists,
-            )
-
         if cfg.direnum:
             dir_enum(cfg, state, url, udir)
-
-        if cfg.profile == "full" and cfg.tools.path("katana"):
-            run_cmd(
-                [cfg.tools.path("katana"), "-u", url, "-silent", "-d", "2", "-c", "5", "-rate-limit", "10",
-                 "-o", str(udir / "katana.txt")],
-                outfile=udir / "katana.log",
-                timeout=min(cfg.timeout, 300),
-                skip_if_exists=cfg.skip_if_exists,
-            )
 
     # Bound per-URL parallelism; dir enum / sslscan can be heavy
     url_threads = min(cfg.threads, 8 if cfg.profile == "full" else 12)
@@ -2459,8 +2853,7 @@ def phase_web(cfg: Config, state: RunState, targets: TargetSet) -> None:
     else:
         log_info("Nuclei disabled (--no-nuclei)")
 
-    # Screenshots
-    screenshot(cfg, base, base / "live-urls.txt")
+    # Screenshots are not taken. Browsers follow redirects off-host. See REDIRECT_UNSCOPED_TOOLS.
 
     # tlsx batched if present
     if cfg.tools.path("tlsx"):
@@ -2604,47 +2997,25 @@ def dir_enum(cfg: Config, state: RunState, url: str, udir: Path) -> None:
         log_warn("No directory wordlist found (install seclists). Skipping content discovery.")
         return
     out = udir / "direnum.txt"
-    threads = 10 if cfg.profile == "full" else 8
 
+    # None of these argv lists pass a follow-redirect flag. A 3xx is recorded, not fetched.
     if cfg.tools.path("feroxbuster"):
         run_cmd(
-            [
-                cfg.tools.path("feroxbuster"),
-                "-u", url, "-w", str(wordlist),
-                "-t", str(threads), "-n", "--quiet", "--no-state",
-                "-C", "404,400,429,501",
-                "--rate-limit", str(min(30, cfg.http_rate)),
-                "-d", "0",  # no recursion — keep it non-intrusive
-                "-o", str(out),
-            ],
+            ferox_args(cfg.tools.path("feroxbuster"), url, wordlist, out, cfg),
             outfile=udir / "direnum.log",
             timeout=min(max(cfg.timeout, 300), 600),
             skip_if_exists=cfg.skip_if_exists,
         )
     elif cfg.tools.path("gobuster"):
         run_cmd(
-            [
-                cfg.tools.path("gobuster"), "dir",
-                "-u", url, "-w", str(wordlist),
-                "-t", str(threads), "-q", "-k",
-                "--timeout", "8s",
-                "-o", str(out),
-            ],
+            gobuster_args(cfg.tools.path("gobuster"), url, wordlist, out, cfg),
             outfile=udir / "direnum.log",
             timeout=min(max(cfg.timeout, 300), 600),
             skip_if_exists=cfg.skip_if_exists,
         )
     elif cfg.tools.path("ffuf"):
         run_cmd(
-            [
-                cfg.tools.path("ffuf"),
-                "-u", url.rstrip("/") + "/FUZZ",
-                "-w", str(wordlist),
-                "-t", str(threads), "-rate", str(min(30, cfg.http_rate)),
-                "-mc", "200,204,301,302,307,401,403",
-                "-of", "json", "-o", str(udir / "direnum.json"),
-                "-s",
-            ],
+            ffuf_args(cfg.tools.path("ffuf"), url, wordlist, udir / "direnum.json", cfg),
             outfile=udir / "direnum.log",
             timeout=min(max(cfg.timeout, 300), 600),
             skip_if_exists=cfg.skip_if_exists,
@@ -2696,51 +3067,21 @@ def run_nuclei(cfg: Config, state: RunState, base: Path, urlfile: Path) -> None:
     if not bin_n:
         cfg.tools.require("nuclei")
         return
-    severity = cfg.nuclei_severity or (
-        "high,critical" if cfg.profile == "quick" else "info,low,medium,high,critical"
-    )
     json_out = base / "nuclei.jsonl"
-    # Safe defaults: rate-limited, exclude DoS / intrusive / fuzz tags
-    cmd = [
-        bin_n,
-        "-l", str(urlfile),
-        "-severity", severity,
-        "-exclude-tags", NUCLEI_EXCLUDED_TAGS,
-        "-rl", str(cfg.http_rate),
-        "-c", str(min(25, max(5, cfg.threads)),),
-        "-timeout", "10",
-        "-retries", "1",
-        "-je", str(json_out),  # some versions use -jsonl / -json-export
-        "-silent",
-        "-no-color",
-    ]
+    cmd = nuclei_probe_args(bin_n, urlfile, json_out, cfg)
     r = run_cmd(cmd, outfile=base / "nuclei.log", timeout=max(cfg.timeout, 1200), skip_if_exists=cfg.skip_if_exists)
-    # Compatibility: older nuclei used -jsonl -o
-    if r.returncode != 0 and not json_out.exists():
-        cmd = [
-            bin_n, "-l", str(urlfile), "-severity", severity,
-            "-exclude-tags", NUCLEI_EXCLUDED_TAGS,
-            "-rl", str(cfg.http_rate), "-c", str(min(25, max(5, cfg.threads))),
-            "-timeout", "10", "-retries", "1",
-            "-jsonl", "-o", str(json_out), "-silent", "-no-color",
-        ]
-        run_cmd(cmd, outfile=base / "nuclei.log", timeout=max(cfg.timeout, 1200), skip_if_exists=False)
+    if r.returncode != 0 and (not json_out.exists() or json_out.stat().st_size == 0):
+        # Do not retry without -disable-redirects. A nuclei that rejects the
+        # flag would otherwise follow per-template redirects off-scope.
+        log_warn("nuclei produced no JSONL. Not retrying without -disable-redirects.")
     count = harvest_nuclei(state, json_out)
     log_ok(f"Nuclei: ingested {count} result(s) (findings of interest, not confirmed exploits)")
 
 
 def harvest_nuclei(state: RunState, path: Path) -> int:
-    if not path.exists():
-        return 0
+    records = parse_nuclei_records(path)
     count = 0
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    for rec in records:
         count += 1
         info = rec.get("info") or {}
         host = rec.get("host") or rec.get("matched-at") or rec.get("matched_at") or rec.get("url") or rec.get("ip") or ""
@@ -2824,22 +3165,37 @@ def screenshot(cfg: Config, base: Path, urlfile: Path) -> None:
 # PHASE 5 — Service-specific enumeration
 # ---------------------------------------------------------------------------
 
-def hosts_with_port(state: RunState, ports: set[int], proto: str = "tcp") -> list[tuple[HostRecord, int]]:
+def hosts_with_port(
+    state: RunState,
+    ports: set[int],
+    proto: str = "tcp",
+    allowed_ips: Optional[set[str]] = None,
+) -> list[tuple[HostRecord, int]]:
+    """Open-port jobs keyed by an allowed IP. Hostnames are not substituted."""
     out = []
     seen = set()
     for hr in state.hosts.values():
-        # Prefer IP keys so tools get an address
         openp = open_ports_for(hr, proto)
         hit = openp & ports
         if not hit:
             continue
-        target = hr.ips[0] if hr.ips else hr.target
+        candidates = [ip for ip in hr.ips if is_ip(ip)]
+        if is_ip(hr.target):
+            candidates.insert(0, hr.target)
+        target = None
+        for ip in candidates:
+            if allowed_ips is None or ip in allowed_ips:
+                target = ip
+                break
+        if target is None:
+            continue
         for p in sorted(hit):
             sig = (target, p, proto)
             if sig in seen:
                 continue
             seen.add(sig)
-            out.append((hr, p))
+            pinned = state.host(target, kind="ip")
+            out.append((pinned, p))
     return out
 
 
@@ -2852,42 +3208,40 @@ def phase_services(cfg: Config, state: RunState, targets: TargetSet) -> None:
     base.mkdir(parents=True, exist_ok=True)
 
     jobs = []
+    allowed_ips = set(portscan_targets(cfg, targets))
 
     def add_job(kind: str, hr: HostRecord, port: int, fn) -> None:
         jobs.append((kind, hr, port, fn))
 
-    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["ftp"]):
+    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["ftp"], allowed_ips=allowed_ips):
         add_job("ftp", hr, port, enum_ftp)
-    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["ssh"]):
+    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["ssh"], allowed_ips=allowed_ips):
         add_job("ssh", hr, port, enum_ssh)
-    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["smtp"]):
+    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["smtp"], allowed_ips=allowed_ips):
         add_job("smtp", hr, port, enum_smtp)
-    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["dns"]):
+    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["dns"], allowed_ips=allowed_ips):
         add_job("dns", hr, port, enum_dns)
-    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["smb"]):
+    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["smb"], allowed_ips=allowed_ips):
         add_job("smb", hr, port, enum_smb)
-    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["snmp"], proto="udp"):
+    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["snmp"], proto="udp", allowed_ips=allowed_ips):
         add_job("snmp", hr, port, enum_snmp)
-    # SNMP often only shows up as tcp-open|filtered or we may have no UDP results —
-    # also try UDP 161 against hosts that had *any* open ports if --udp wasn't used? Too noisy.
-    # If UDP wasn't scanned, optionally probe 161 only when the operator asked --udp (already handled).
-    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["ldap"]):
+    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["ldap"], allowed_ips=allowed_ips):
         add_job("ldap", hr, port, enum_ldap)
-    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["rdp"]):
+    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["rdp"], allowed_ips=allowed_ips):
         add_job("rdp", hr, port, enum_rdp)
-    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["vnc"]):
+    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["vnc"], allowed_ips=allowed_ips):
         add_job("vnc", hr, port, enum_vnc)
-    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["mssql"]):
+    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["mssql"], allowed_ips=allowed_ips):
         add_job("mssql", hr, port, enum_mssql)
-    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["mysql"]):
+    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["mysql"], allowed_ips=allowed_ips):
         add_job("mysql", hr, port, enum_mysql)
-    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["redis"]):
+    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["redis"], allowed_ips=allowed_ips):
         add_job("redis", hr, port, enum_banner_script)
-    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["mongodb"]):
+    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["mongodb"], allowed_ips=allowed_ips):
         add_job("mongodb", hr, port, enum_banner_script)
-    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["docker"]):
+    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["docker"], allowed_ips=allowed_ips):
         add_job("docker", hr, port, enum_banner_script)
-    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["k8s"]):
+    for hr, port in hosts_with_port(state, SERVICE_PORT_MAP["k8s"], allowed_ips=allowed_ips):
         add_job("k8s", hr, port, enum_banner_script)
 
     # Zone transfers against discovered NS even if port 53 wasn't in the nmap top-ports set
@@ -2904,7 +3258,10 @@ def phase_services(cfg: Config, state: RunState, targets: TargetSet) -> None:
         if kind == "axfr-apex":
             enum_zone_transfers(cfg, state, targets, base / "axfr")
             return
-        target = hr.ips[0] if hr.ips else hr.target
+        target = hr.target if is_ip(hr.target) else (hr.ips[0] if hr.ips else "")
+        if not target or not ip_allowed(target, cfg, targets):
+            log_info(f"Skipping {kind} enum: {target or hr.target} is not an in-scope address")
+            return
         sdir = base / safe_name(target)
         sdir.mkdir(parents=True, exist_ok=True)
         try:
@@ -2983,26 +3340,36 @@ def harvest_ssh_audit(state: RunState, host: str, path: Path) -> None:
 
 
 def enum_smtp(cfg: Config, state: RunState, hr: HostRecord, target: str, port: int, sdir: Path) -> None:
-    # One VRFY probe name so nmap does not walk its default username database.
-    probe = sdir / "smtp-vrfy-probe.txt"
-    write_text(probe, "herecyex-probe\n")
-    nmap_script_enum(
-        cfg, state, target, port,
-        "smtp-commands,smtp-open-relay,smtp-vrfy",
-        sdir / f"smtp-{port}",
-        script_args=f"smtp-vrfy.userdb={probe}",
-    )
+    scripts = smtp_scripts(cfg)
+    args = None
+    if "smtp-enum-users" in scripts:
+        probe = sdir / "smtp-single-probe.txt"
+        write_text(probe, SMTP_SINGLE_PROBE + "\n")
+        args = smtp_script_args(probe)
+    else:
+        log_info(
+            f"SMTP {target}:{port}: smtp-commands only. "
+            "smtp-vrfy is not an NSE script. smtp-enum-users and smtp-open-relay "
+            "stay off without --allow-intrusive-checks and --authorized."
+        )
+    nmap_script_enum(cfg, state, target, port, scripts, sdir / f"smtp-{port}", script_args=args)
     hr.services.setdefault("smtp", []).append({"port": port})
 
 
 def enum_dns(cfg: Config, state: RunState, hr: HostRecord, target: str, port: int, sdir: Path) -> None:
-    # AXFR against this name server for every apex in scope
+    """AXFR only at the in-scope address that had port 53 open. Never at a hostname."""
     bin_dig = cfg.tools.path("dig")
     if not bin_dig:
         return
-    apexes = unique(registrable_domain(n) for n in (hr.names + state.subdomains + [hr.target]) if is_domain(n) or is_domain(str(n)))
-    # Also use global subdomains' apexes
-    for name in list(apexes) or []:
+    if not is_ip(target):
+        log_warn(f"Skipping AXFR against {target}: not an address")
+        return
+    zones = unique(
+        registrable_domain(n)
+        for n in list(hr.names) + list(state.subdomains)
+        if is_domain(n)
+    )
+    for name in zones:
         outfile = sdir / f"axfr-{safe_name(name)}-{port}.txt"
         r = run_cmd(
             [bin_dig, f"@{target}", name, "AXFR", "+time=8", "+tries=1"],
@@ -3026,14 +3393,38 @@ def enum_zone_transfers(cfg: Config, state: RunState, targets: TargetSet, dest: 
         rns = run_cmd([bin_dig, "+short", apex, "NS"], timeout=20, quiet=True, skip_if_exists=False)
         nss = [ln.strip().rstrip(".") for ln in rns.stdout.splitlines() if ln.strip()]
         for ns in nss:
-            outfile = dest / f"axfr-{safe_name(apex)}-via-{safe_name(ns)}.txt"
-            r = run_cmd(
-                [bin_dig, f"@{ns}", apex, "AXFR", "+time=8", "+tries=1"],
-                outfile=outfile,
-                timeout=30,
-                skip_if_exists=cfg.skip_if_exists,
-            )
-            harvest_axfr(state, ns, apex, outfile, r.stdout)
+            ips: list[str] = [ns] if is_ip(ns) else []
+            if not is_ip(ns):
+                for rr in ("A", "AAAA"):
+                    ra = run_cmd(
+                        [bin_dig, "+short", ns, rr],
+                        timeout=15,
+                        quiet=True,
+                        skip_if_exists=False,
+                    )
+                    for line in ra.stdout.splitlines():
+                        cand = line.strip().split()[-1] if line.strip() else ""
+                        if is_ip(cand):
+                            ips.append(cand)
+            chosen = axfr_server_ips(ns, ips, cfg, targets)
+            if not chosen:
+                log_warn(f"Skipping AXFR via {ns}: name server is not an in-scope address")
+                targets.scope_decisions.append({
+                    "name": ns.rstrip(".").lower(),
+                    "ips": ips,
+                    "active": False,
+                    "reason": "AXFR not sent; name server is outside the allowlist or the target IP/CIDR set",
+                })
+                continue
+            for ip in chosen:
+                outfile = dest / f"axfr-{safe_name(apex)}-via-{safe_name(ip)}.txt"
+                r = run_cmd(
+                    [bin_dig, f"@{ip}", apex, "AXFR", "+time=8", "+tries=1"],
+                    outfile=outfile,
+                    timeout=30,
+                    skip_if_exists=cfg.skip_if_exists,
+                )
+                harvest_axfr(state, ip, apex, outfile, r.stdout)
 
 
 def harvest_axfr(state: RunState, server: str, zone: str, path: Path, stdout: str = "") -> None:
@@ -3173,26 +3564,27 @@ def enum_vnc(cfg: Config, state: RunState, hr: HostRecord, target: str, port: in
 
 
 def enum_mssql(cfg: Config, state: RunState, hr: HostRecord, target: str, port: int, sdir: Path) -> None:
-    # ms-sql-empty-password tries the blank sa password once. It is not a wordlist.
-    nmap_script_enum(cfg, state, target, port, "ms-sql-info,ms-sql-ntlm-info,ms-sql-empty-password", sdir / f"mssql-{port}")
+    # Empty-password login is off unless --allow-intrusive-checks and --authorized.
+    nmap_script_enum(cfg, state, target, port, mssql_scripts(cfg), sdir / f"mssql-{port}")
     hr.services.setdefault("mssql", []).append({"port": port})
 
 
 def enum_mysql(cfg: Config, state: RunState, hr: HostRecord, target: str, port: int, sdir: Path) -> None:
-    # mysql-empty-password tries a blank password once. It is not a wordlist.
-    nmap_script_enum(cfg, state, target, port, "mysql-info,mysql-empty-password", sdir / f"mysql-{port}")
+    nmap_script_enum(cfg, state, target, port, mysql_scripts(cfg), sdir / f"mysql-{port}")
     hr.services.setdefault("mysql", []).append({"port": port})
 
 
 def enum_banner_script(cfg: Config, state: RunState, hr: HostRecord, target: str, port: int, sdir: Path) -> None:
     """Light, safe nmap version/script probes for less common management services."""
+    # http-title and http-methods use the NSE HTTP library, and a script can
+    # override its redirect check. Banner and ssl-cert stay on this connection.
     scripts = {
         6379: "redis-info",
         27017: "mongodb-info,mongodb-databases",
-        2375: "http-title,http-methods",
-        2376: "ssl-cert,http-title",
-        6443: "ssl-cert,http-title,http-methods",
-        10250: "ssl-cert,http-title",
+        2375: "banner",
+        2376: "ssl-cert",
+        6443: "ssl-cert",
+        10250: "ssl-cert",
     }.get(port, "banner")
     nmap_script_enum(cfg, state, target, port, scripts, sdir / f"svc-{port}")
     # Flag obviously exposed management APIs from titles / scripts already harvested
@@ -3738,7 +4130,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-direnum", action="store_true", help="Disable web content discovery")
     p.add_argument("--wordlist", metavar="FILE", help="Wordlist for content discovery (defaults to SecLists/dirb common lists)")
     p.add_argument("--nikto", action="store_true", help="Enable optional nikto scans (off by default; can be noisy)")
-    p.add_argument("--testssl", action="store_true", help="Use testssl.sh in addition to / instead of sslscan")
+    p.add_argument("--testssl", action="store_true",
+                   help="Also run testssl (Kali binary) or testssl.sh alongside sslscan")
+    p.add_argument("--allow-intrusive-checks", action="store_true",
+                   help="Per-engagement opt-in for smtp-open-relay, one-name smtp-enum-users VRFY, "
+                        "and empty-password database scripts. Requires --authorized (or the YES prompt). Off by default.")
     p.add_argument("--force", action="store_true", help="Do not skip existing tool output (re-run everything)")
     p.add_argument("--check-tools", action="store_true", help="Detect installed tools, print a report, and exit")
     p.add_argument("--max-cidr-hosts", type=int, default=4096, help="Refuse to expand CIDRs larger than this (default: 4096)")
@@ -3881,6 +4277,9 @@ def build_config(args: argparse.Namespace, tools: Toolset, outdir: Path) -> Conf
         alive_only=bool(args.alive_only),
         http_rate=max(1, int(args.http_rate)),
         naabu_rate=max(1, int(args.naabu_rate)),
+        allow_intrusive_checks=bool(args.allow_intrusive_checks),
+        authorized=bool(args.authorized),
+        scope_enforced=bool(args.scope_check),
     )
 
 
@@ -3924,6 +4323,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not confirm_authorized(args.authorized):
         print("Aborted — authorization not confirmed.", file=sys.stderr)
         return 3
+    # A typed YES is authorization. The intrusive-check gate treats it the same as --authorized.
+    args.authorized = True
 
     try:
         outdir = prepare_outdir(args)
@@ -3951,6 +4352,19 @@ def main(argv: Optional[list[str]] = None) -> int:
             log_warn(note)
     write_run_meta(outdir, args, cfg, tools)
 
+    if cfg.allow_intrusive_checks and cfg.authorized:
+        log_warn(
+            "Intrusive NSE checks are ON (smtp-open-relay, one VRFY probe, empty-password DB scripts). "
+            "That switch needs per-engagement approval."
+        )
+    elif cfg.allow_intrusive_checks:
+        log_warn("--allow-intrusive-checks ignored: authorization was not confirmed.")
+    if not cfg.scope_enforced:
+        log_warn(
+            "No --scope-check file. Domain-only lists are probed as named. "
+            "If the list has any IP or CIDR, a name is probed only when every resolved address is inside that set. "
+            "Unresolved names are not probed."
+        )
     log_info(f"HerecyEx v{__version__}  profile={cfg.profile}  phases={','.join(cfg.phases)}  threads={cfg.threads}")
     log_info(f"Output: {outdir}")
     if not is_root():
