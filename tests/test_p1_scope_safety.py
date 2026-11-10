@@ -57,15 +57,18 @@ def _scoped(tmp: Path):
     return cfg, ts
 
 
+def row_active_is_false(ts: hx.TargetSet, name: str) -> bool:
+    return any(row["name"] == name and row["active"] is False for row in ts.scope_decisions)
+
+
 def test_out_of_scope_dns_is_candidate_only():
     with tempfile.TemporaryDirectory() as raw:
         cfg, ts = _scoped(Path(raw))
-        assert "cdn.example.com" in ts.candidates
-        assert "cdn.example.com" in ts.domains  # kept, not deleted
-        assert "cdn.example.com" not in ts.active_names
-        assert "mixed.example.com" not in ts.active_names
-        assert "dangling.example.com" not in ts.active_names
-        assert "www.example.com" in ts.active_names
+        assert ts.active_names == []
+        for name in ("www.example.com", "cdn.example.com", "mixed.example.com", "dangling.example.com", "example.com"):
+            assert name in ts.candidates or name in ts.domains
+            assert name not in ts.active_names
+        assert "cdn.example.com" in ts.domains
         probes = hx.filter_probe_tokens(
             [
                 "https://www.example.com",
@@ -74,13 +77,18 @@ def test_out_of_scope_dns_is_candidate_only():
                 "https://dangling.example.com",
                 "198.51.100.50",
                 "203.0.113.10",
+                "https://203.0.113.10",
             ],
             cfg,
             ts,
         )
-        assert probes == ["https://www.example.com", "203.0.113.10"], probes
+        assert probes == ["203.0.113.10", "https://203.0.113.10"], probes
         assert hx.portscan_targets(cfg, ts) == ["203.0.113.10"]
         assert "198.51.100.50" not in ts.ips
+        assert hx.nuclei_enabled(cfg) is False
+        reasons = {row["name"]: row["reason"] for row in ts.scope_decisions}
+        assert "not pinned" in reasons["www.example.com"]
+        assert reasons["www.example.com"] and row_active_is_false(ts, "www.example.com")
 
 
 def test_redirect_is_not_a_probe_target():
@@ -88,17 +96,21 @@ def test_redirect_is_not_a_probe_target():
         cfg, ts = _scoped(Path(raw))
         off = "https://evil.example/landing"
         assert hx.consider_redirect(off, cfg, ts) is False
-        assert hx.consider_redirect("https://www.example.com/app", cfg, ts) is True
-        assert "evil.example" not in hx.filter_probe_tokens(
-            ["https://www.example.com", off], cfg, ts
-        )
+        # The name resolved in-scope, and it is still not probed. DNS is not pinned.
+        assert hx.consider_redirect("https://www.example.com/app", cfg, ts) is False
+        assert hx.consider_redirect("https://203.0.113.10/", cfg, ts) is True
+        assert hx.filter_probe_tokens(["https://www.example.com", off, "https://203.0.113.10"], cfg, ts) == [
+            "https://203.0.113.10"
+        ]
 
 
 def test_child_commands_do_not_follow_off_host_redirects():
     with tempfile.TemporaryDirectory() as raw:
         cfg, ts = _scoped(Path(raw))
-        url = "https://www.example.com"
+        url = "https://203.0.113.10"
         assert hx.url_host_allowed(url, cfg, ts)
+        assert hx.url_host_allowed("https://www.example.com", cfg, ts) is False
+        assert hx.nuclei_enabled(cfg) is False
         httpx = hx.httpx_probe_args("httpx", Path("in.txt"), Path("out.json"), cfg)
         nuclei = hx.nuclei_probe_args("nuclei", Path("urls.txt"), Path("nuclei.jsonl"), cfg)
         whatweb = hx.whatweb_args("whatweb", url, cfg)

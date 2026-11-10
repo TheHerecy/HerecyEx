@@ -156,11 +156,11 @@ The CLI prints each phase as a stage panel. Inside a phase, work runs with a sma
 
 ### 1. `passive` — OSINT / subdomain discovery (domains only)
 
-For each apex domain: `whois`, `dig` (A/AAAA/MX/NS/TXT/SOA/CAA), `subfinder`, `amass enum -passive`, `assetfinder`, a crt.sh JSON query, `theHarvester` (free sources), plus `gau` and `waybackurls` for historical URLs. `dnsrecon -t std` is not run, because it attempts a zone transfer. Discovered hostnames are de-duplicated and kept. They are not actively probed until resolution shows every address is in scope.
+For each apex domain: `whois`, `dig` (A/AAAA/MX/NS/TXT/SOA/CAA), `subfinder`, `amass enum -passive`, `assetfinder`, a crt.sh JSON query, `theHarvester` (free sources), plus `gau` and `waybackurls` for historical URLs. `dnsrecon -t std` is not run, because it attempts a zone transfer. Discovered hostnames are de-duplicated and kept as candidates. With `--scope-check`, they are not actively probed at all.
 
 ### 2. `resolve` — DNS resolution and liveness
 
-`dnsx` (then massdns, then threaded `dig`) resolves names to A/AAAA. A name is eligible for later active probes only when every address is in scope. Otherwise it stays a candidate. Liveness is informational (`fping` or `nmap -sn`) and only for allowed addresses. The first `httpx` pass does not follow redirects. `--no-active` still resolves DNS but skips ping and httpx.
+`dnsx` (then massdns, then threaded `dig`) resolves names to A/AAAA so the report can show where a candidate pointed. With `--scope-check` that resolution does **not** authorize probing the name. Active probes use allowlisted IP addresses only. Liveness (`fping` or `nmap -sn`) and the first `httpx` pass see those IPs, and httpx is not passed `-follow-redirects`. `--no-active` still resolves DNS but skips ping and httpx.
 
 ### 3. `ports` — Port discovery + service confirmation
 
@@ -168,9 +168,11 @@ A fast front-end is used when present, in this order: **naabu → rustscan → m
 
 ### 4. `web` — Web and TLS enumeration
 
-`httpx` (title, tech, status, server, TLS, Location header) on in-scope hosts only. It is not passed `-follow-redirects`. A Location pointing at another host is recorded and not requested. Then per-URL `whatweb` (`--follow-redirect=never`), `wafw00f -r`, `sslscan`, and `testssl` / `testssl.sh` with `--testssl` (or as a fallback when sslscan is absent). Kali's package installs the binary as `testssl`. Optional `tlsx`. Nuclei is rate-limited, always passed `-disable-redirects`, `-no-interactsh`, and `-exclude-tags dos,fuzz,intrusive,brute`, and writes JSONL (`-jsonl -o`). The parser also accepts a JSON array so an older export is not dropped. Content discovery (`feroxbuster`, then `gobuster`, then `ffuf`) does not pass a follow-redirect flag. It is modest, non-recursive, rate-capped, and off unless `--full` or `--direnum`.
+With `--scope-check`, this phase receives IP URLs only. `httpx` is not passed `-follow-redirects`. `whatweb` is `--follow-redirect=never`. `wafw00f` is `-r`. `sslscan`, `testssl` (Kali's binary name; `testssl.sh` is also accepted), and `tlsx` are given the same IP. Content discovery, when `--full` or `--direnum` turned it on, is also IP-only and is not passed a follow-redirect flag.
 
-Katana, gowitness, EyeWitness, and Nikto are not started. Their clients follow redirects onto other hosts and cannot be given a scope pin. That is a limit of those tools.
+Nuclei does not run when `--scope-check` is set, even if `--no-nuclei` was omitted. A template can request a host other than the input, and that cannot be bounded. Without `--scope-check`, nuclei is rate-limited, passed `-disable-redirects`, `-no-interactsh`, and `-exclude-tags dos,fuzz,intrusive,brute`, and writes JSONL. The parser also accepts a JSON array.
+
+Katana, gowitness, EyeWitness, and Nikto are not started. `--full` and `--nikto` do not turn them back on. Their clients follow redirects onto other hosts.
 
 ### 5. `services` — Service-specific enum from open ports
 
@@ -221,18 +223,18 @@ Re-running with `--resume` against the same directory skips existing non-empty o
 | | `--quick` | default (standard) | `--full` |
 |--|-----------|--------------------|----------|
 | TCP ports | top 100 | top 1000 | top 1000 (optional `-p-`) |
-| Nuclei severity | high,critical | all | all |
+| Nuclei | off with `--scope-check` | off with `--scope-check`; otherwise high,critical / all / all | off with `--scope-check` |
 | Content discovery | off | off | on (rate-limited, no recursion) |
 | Katana crawl | off | off | off (cannot pin redirects) |
 
 ## Safety model
 
 - Authorization is a gate. `--authorized` records that the operator already has written permission. Otherwise a TTY must answer `YES`. A non-interactive run without `--authorized` exits 3 and does not create an output directory. Piping the process (`python3 ... | tail`) masks that code: `$?` is then the pipe's last command, not HerecyEx. Check the Python process itself.
-- `--scope-check` is fail-closed. A discovered name is actively probed only when it resolved and **every** address is inside the allowlist. A mixed or unresolved answer stays a candidate. Out-of-scope addresses are not port-scanned, passed to httpx, nuclei, or service enum, and are not AXFR targets. An allowlist with only domain suffixes cannot prove an address, so active probes of those names are not started.
+- `--scope-check` makes the active workflow IP-only. Every hostname stays a candidate, including one whose addresses were inside the allowlist at resolution time. DNS is not pinned, and hostname active coverage is disabled. This is not DNS-scope enforcement. Allowlisted IPs are still port-scanned, service-enumerated, and reported. Out-of-scope addresses are not. Nuclei is not started. Katana, gowitness, EyeWitness, and nikto are not started even if `--full` or `--nikto` was passed.
 - Without `--scope-check`, a domain-only list is the operator's responsibility and those names are probed. If the list contains any IP or CIDR, a name is probed only when every resolved address is inside that set. Unresolved names are not probed.
 - Zone transfer is sent only to an in-scope address. `dnsrecon -t std` is not run, because it attempts AXFR before that check.
 - Passive mode (`--no-active`) does not ping, port-scan, or send HTTP probes.
-- Nuclei always excludes the `dos`, `fuzz`, `intrusive`, and `brute` tags, and is passed `-disable-redirects` and `-no-interactsh`. Exclude-tags are not treated as a scope boundary.
+- When nuclei runs, it excludes the `dos`, `fuzz`, `intrusive`, and `brute` tags and is passed `-disable-redirects` and `-no-interactsh`. It does not run under `--scope-check`. Those flags are not treated as a scope boundary.
 - No password wordlists, no community-string lists beyond `public`, no `smb-brute` / `ftp-brute` / `ssh-brute`, and no exploit or auth-bypass NSE scripts.
 - `smtp-open-relay`, `smtp-enum-users`, `ms-sql-empty-password`, and `mysql-empty-password` do not run unless `--allow-intrusive-checks` and authorization are both set. The VRFY probe, when enabled, is the single name `herecyex-probe` with `unpwdb.userlimit=1` and `methods={VRFY}`.
 - httpx is not told to follow redirects. whatweb is `--follow-redirect=never`. wafw00f is `-r`. Directory tools are not passed their follow-redirect flags. A Location to another host is not enqueued.
@@ -240,17 +242,23 @@ Re-running with `--resume` against the same directory skips existing non-empty o
 - masscan, when used at all, is limited to 500 packets/second.
 - Findings of interest are recon leads. The JSON, Markdown, and HTML reports say so in the disclaimer and on every finding.
 
-### What the child tools still cannot promise
+### IP-only limit under `--scope-check`
 
-- DNS can change between the scope check and the probe. HerecyEx does not pin httpx or nuclei to the address it just resolved. A name that was entirely in-scope can later point somewhere else.
-- A nuclei template can still request a URL it writes itself. `-disable-redirects` stops the HTTP client from following 3xx, including a template that sets `redirects: true`. It does not stop a template from naming another host.
-- Nmap's HTTP library refuses a different host unless a script replaces `redirect_ok`. `-sC` is omitted because that set is not reviewed script by script. The explicit service scripts that remain do not include `http-title` or `http-methods`.
-- enum4linux-ng, smbmap, ssh-audit, snmpwalk, and ldapsearch are given an in-scope address and do not follow HTTP redirects. They are not a redirect hop. They also are not a proof that every future flag of those tools stays on-box.
-- Katana, gowitness, EyeWitness, and Nikto are skipped because they follow redirects onto other hosts and cannot be pinned.
+Address pinning is not implemented. A hostname is never handed to httpx, nmap, nuclei, or the service scripts while `--scope-check` is set. The verified active inputs are the allowlisted IP addresses. Do not read a candidate's resolved addresses as permission to probe the name.
+
+Nuclei is off for that run. The flags that would have been used without `--scope-check` are `-jsonl -o`, `-disable-redirects`, `-no-interactsh`, and `-exclude-tags dos,fuzz,intrusive,brute`. Those flags do not make template host requests bounded, so they are not used as a reason to leave nuclei on.
+
+httpx, when it runs against an allowlisted IP, is not passed `-follow-redirects` or `-follow-host-redirects`. whatweb is `--follow-redirect=never`. wafw00f includes `-r`. ffuf is not passed `-r`. feroxbuster is not passed `--redirects`. gobuster is not passed `-r`. nmap service confirmation is `-sV` and does not include `-sC`.
+
+### What is still not claimed
+
+- Probing an allowlisted IP does not prove the hostname that used to point there is still on that IP.
+- Without `--scope-check`, a domain-only list is still probed by name. That mode is the operator's list, not a scope check.
+- enum4linux-ng, smbmap, ssh-audit, snmpwalk, and ldapsearch receive an allowlisted address. They do not follow HTTP redirects. That is not a review of every future flag of those tools.
 
 ### Bounded smoke after install
 
-Replace the two TEST-NET-3 addresses with the two hosts that are actually in scope before running this. Do not add `--allow-intrusive-checks` or `--nikto`. This command is not run by the workflow itself.
+Replace the two TEST-NET-3 addresses with two in-scope addresses before a real engagement. The command is IP-only because of `--scope-check`: nuclei will not run, and any hostname in the target file stays a candidate. Do not add `--allow-intrusive-checks`. `--nikto` and `--full` do not turn the refused tools back on. This command is not run by the workflow itself.
 
 ```bash
 printf '%s\n' '203.0.113.10' '203.0.113.11' > /tmp/herecy-two-hosts.txt

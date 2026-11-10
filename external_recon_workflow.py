@@ -1065,22 +1065,46 @@ def ip_allowed(ip: str, cfg: "Config", targets: TargetSet) -> bool:
     return bool(targets.seed_domains)
 
 
-def name_may_be_probed(name: str, ips: Iterable[str], cfg: "Config", targets: TargetSet) -> tuple[bool, str]:
-    """A hostname is probed only when every resolved address is allowed.
+def nuclei_enabled(cfg: "Config") -> bool:
+    """Nuclei stays off under --scope-check. Templates can request other hosts."""
+    if getattr(cfg, "no_nuclei", False):
+        return False
+    if getattr(cfg, "scope_enforced", False):
+        return False
+    return True
 
-    Unresolved names and mixed in-scope/out-of-scope answers fail closed.
-    The name is still kept as a candidate either way.
+
+_SCOPED_IP_ONLY_WARNED = False
+
+
+def warn_scoped_ip_only(cfg: "Config") -> None:
+    """One clear warning. Hostname coverage is off; DNS scope is not claimed fixed."""
+    global _SCOPED_IP_ONLY_WARNED
+    if not getattr(cfg, "scope_enforced", False) or _SCOPED_IP_ONLY_WARNED:
+        return
+    _SCOPED_IP_ONLY_WARNED = True
+    log_warn(
+        "Scoped active workflow is IP-only. Hostname active coverage is disabled. "
+        "Discovered names stay candidates. DNS is not pinned, so this is not DNS-scope enforcement. "
+        "Nuclei, katana, gowitness, EyeWitness, and nikto are not started, "
+        "even if --full, --nikto, or the default nuclei run was requested."
+    )
+
+
+def name_may_be_probed(name: str, ips: Iterable[str], cfg: "Config", targets: TargetSet) -> tuple[bool, str]:
+    """Whether an active probe may use this hostname.
+
+    With --scope-check the answer is always no. Address pinning is not implemented,
+    so a name is not treated as in scope just because it resolved inside the allowlist.
+    Without --scope-check, IP/CIDR lists still fail closed on unresolved or out-of-range answers.
     """
     resolved = [ip for ip in ips if is_ip(ip)]
     if getattr(cfg, "scope_enforced", False):
-        if not cfg.scope_nets:
-            return False, "allowlist has no networks, so resolved addresses cannot be proven in scope"
-        if not resolved:
-            return False, "unresolved under --scope-check"
-        outside = [ip for ip in resolved if not ip_allowed(ip, cfg, targets)]
-        if outside:
-            return False, "not every resolved IP is in the allowlist: " + ", ".join(outside)
-        return True, "every resolved IP is in the allowlist"
+        warn_scoped_ip_only(cfg)
+        return False, (
+            "hostname active probing is disabled under --scope-check; "
+            "DNS is not pinned to the resolved addresses"
+        )
     if targets.seed_networks:
         if not resolved:
             return False, "unresolved; IP/CIDR targets fail closed without --scope-check"
@@ -2797,13 +2821,20 @@ def phase_web(cfg: Config, state: RunState, targets: TargetSet) -> None:
         targets,
     )
     write_lines(base / "live-urls.txt", live_urls)
-    for tool, reason in REDIRECT_UNSCOPED_TOOLS.items():
-        if tool == "nikto" and not cfg.nikto:
-            continue
-        if tool == "katana" and cfg.profile != "full":
-            continue
-        if cfg.tools.path(tool) or (tool == "nikto" and cfg.nikto):
-            log_warn(reason)
+    if cfg.scope_enforced:
+        warn_scoped_ip_only(cfg)
+        if cfg.nikto:
+            log_warn("nikto was requested and is refused under --scope-check. " + REDIRECT_UNSCOPED_TOOLS["nikto"])
+        if cfg.profile == "full":
+            log_warn("katana is refused under --scope-check. " + REDIRECT_UNSCOPED_TOOLS["katana"])
+    else:
+        for tool, reason in REDIRECT_UNSCOPED_TOOLS.items():
+            if tool == "nikto" and not cfg.nikto:
+                continue
+            if tool == "katana" and cfg.profile != "full":
+                continue
+            if cfg.tools.path(tool) or (tool == "nikto" and cfg.nikto):
+                log_warn(reason)
     if not live_urls:
         log_info("No live web endpoints discovered")
         state.save()
@@ -2847,9 +2878,13 @@ def phase_web(cfg: Config, state: RunState, targets: TargetSet) -> None:
     url_threads = min(cfg.threads, 8 if cfg.profile == "full" else 12)
     run_pool(per_url, live_urls, url_threads, "web per-URL enum")
 
-    # Nuclei — one batched run against the live URL list
-    if not cfg.no_nuclei:
+    # Nuclei can request hosts other than the URL it was given. Under
+    # --scope-check it is not started, including when the operator did not pass --no-nuclei.
+    if nuclei_enabled(cfg):
         run_nuclei(cfg, state, base, base / "live-urls.txt")
+    elif cfg.scope_enforced:
+        warn_scoped_ip_only(cfg)
+        log_warn("Nuclei disabled: --scope-check is set. Template requests cannot be limited to the input host.")
     else:
         log_info("Nuclei disabled (--no-nuclei)")
 
@@ -4359,7 +4394,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
     elif cfg.allow_intrusive_checks:
         log_warn("--allow-intrusive-checks ignored: authorization was not confirmed.")
-    if not cfg.scope_enforced:
+    if cfg.scope_enforced:
+        warn_scoped_ip_only(cfg)
+    else:
         log_warn(
             "No --scope-check file. Domain-only lists are probed as named. "
             "If the list has any IP or CIDR, a name is probed only when every resolved address is inside that set. "
