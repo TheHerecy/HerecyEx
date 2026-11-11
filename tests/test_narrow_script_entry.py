@@ -42,17 +42,30 @@ ALLOWED = {
     "--help",
     "-h",
     "--version",
+    # Narrow-only controls. Recon flags such as --threads and --rate stay refused.
+    "--dry-run",
+    "--narrow-workers",
+    "--narrow-rate",
+    "--narrow-connect-timeout",
+    "--narrow-host-timeout",
+    "--narrow-min-prefix-v4",
+    "--narrow-min-prefix-v6",
+    "--narrow-max-addresses",
+    "--narrow-allow-broad-cidr",
 }
 
 GUARD = r"""
-import os, socket, subprocess, shutil, urllib.request
+import os, socket, subprocess, shutil, threading, urllib.request
 _log_path = os.environ.get("NARROW_GUARD_LOG", "")
+_log_lock = threading.Lock()
 
 def _log(kind, detail):
     if not _log_path:
         return
-    with open(_log_path, "a", encoding="utf-8") as handle:
-        handle.write(kind + "\t" + detail.replace("\n", " ") + "\n")
+    # Narrow runs are concurrent. One locked append keeps each record on its own line.
+    with _log_lock:
+        with open(_log_path, "a", encoding="utf-8") as handle:
+            handle.write(kind + "\t" + detail.replace("\n", " ") + "\n")
 
 def _blocked(kind):
     def inner(*_args, **_kwargs):

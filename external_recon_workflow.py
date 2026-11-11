@@ -4188,14 +4188,32 @@ def build_parser() -> argparse.ArgumentParser:
                    help="naabu packets per second (default: 1000)")
     p.add_argument("--narrow-checks", action="store_true",
                    help="Run only admitted tls/ssh/smb checks from --manifest. Off by default. "
-                        "Not enabled by --quick. The only other flags accepted are --manifest, "
-                        "--scope-check, --admit, --authorized, and -o/--output. Any other flag, "
-                        "including one typed at its usual default, is refused before any tool "
-                        "or output directory.")
+                        "Not enabled by --quick. Recon flags are refused. Narrow scope flags "
+                        "(--dry-run, --narrow-workers, --narrow-rate, --narrow-connect-timeout, "
+                        "--narrow-host-timeout, --narrow-min-prefix-v4, --narrow-min-prefix-v6, "
+                        "--narrow-max-addresses, --narrow-allow-broad-cidr) are accepted.")
     p.add_argument("--manifest", metavar="FILE",
                    help="Narrow-check rows: tls|ssh|smb IP PORT. Used only with --narrow-checks.")
     p.add_argument("--admit", metavar="FILE",
                    help="Exact ip:port admissions. Used only with --narrow-checks. A bare IP is not enough.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Narrow checks: print the expanded scope and exit. No DNS, no probes, no output directory.")
+    p.add_argument("--narrow-workers", type=int, default=2,
+                   help="Narrow checks: max concurrent host checks (default: 2).")
+    p.add_argument("--narrow-rate", type=float, default=0.2,
+                   help="Narrow checks: seconds between host-check starts (default: 0.2).")
+    p.add_argument("--narrow-connect-timeout", type=int, default=10,
+                   help="Narrow checks: per-host connect timeout in seconds (default: 10).")
+    p.add_argument("--narrow-host-timeout", type=int, default=0,
+                   help="Narrow checks: overall process timeout. 0 keeps ssh 30 / tls 90 / smb 45.")
+    p.add_argument("--narrow-min-prefix-v4", type=int, default=24,
+                   help="Narrow checks: reject IPv4 CIDRs broader than this prefix (default: 24).")
+    p.add_argument("--narrow-min-prefix-v6", type=int, default=120,
+                   help="Narrow checks: reject IPv6 CIDRs broader than this prefix (default: 120).")
+    p.add_argument("--narrow-max-addresses", type=int, default=1024,
+                   help="Narrow checks: refuse when included networks sum past this many addresses (default: 1024).")
+    p.add_argument("--narrow-allow-broad-cidr", action="store_true",
+                   help="Narrow checks: lift the prefix floor. Does not allow /0 and does not lift the address cap.")
     p.add_argument("--version", action="version", version=f"HerecyEx {__version__}")
     return p
 
@@ -4358,11 +4376,16 @@ def write_run_meta(outdir: Path, args: argparse.Namespace, cfg: Config, tools: T
 _NARROW_RUNNER = None
 _NARROW_WHICH = None
 _NARROW_NOW = None
+_NARROW_RESOLVER = None
 
-# Anything else on the argv, even when the value equals the usual default, is a
-# recon option and is refused. --phases all and --threads 8 are not exempt.
-_NARROW_BARE_OPTIONS = {"--narrow-checks", "--authorized"}
-_NARROW_VALUE_OPTIONS = {"--manifest", "--scope-check", "--admit", "--output", "-o"}
+# Recon options are refused even when the value equals the usual default.
+# --phases all and --threads 8 are not exempt. The narrow-* flags are not recon flags.
+_NARROW_BARE_OPTIONS = {"--narrow-checks", "--authorized", "--dry-run", "--narrow-allow-broad-cidr"}
+_NARROW_VALUE_OPTIONS = {
+    "--manifest", "--scope-check", "--admit", "--output", "-o",
+    "--narrow-workers", "--narrow-rate", "--narrow-connect-timeout", "--narrow-host-timeout",
+    "--narrow-min-prefix-v4", "--narrow-min-prefix-v6", "--narrow-max-addresses",
+}
 
 
 def narrow_mode_conflicts(argv: list[str]) -> list[str]:
@@ -4408,8 +4431,13 @@ def run_admitted_narrow_checks(args: argparse.Namespace) -> int:
         if not path.is_file():
             print(f"error: missing file: {path}", file=sys.stderr)
             return 2
-    rows = narrow_checks.parse_manifest(manifest)
+        rows = narrow_checks.parse_manifest(manifest)
     outdir = Path(args.output).expanduser()
+    try:
+        limits = narrow_checks.limits_from_args(args)
+    except narrow_checks.NarrowInputError as exc:
+        print(f"refused: {exc.message}", file=sys.stderr)
+        return 2
     report = narrow_checks.run_manifest(
         rows,
         scope_file=scope,
@@ -4418,31 +4446,15 @@ def run_admitted_narrow_checks(args: argparse.Namespace) -> int:
         runner=_NARROW_RUNNER,
         which=_NARROW_WHICH or shutil.which,
         now=_NARROW_NOW,
+        limits=limits,
+        resolver=_NARROW_RESOLVER,
+        install_signals=True,
+        dry_run=bool(args.dry_run),
     )
-    if report.get("refused"):
-        if report.get("error"):
-            print(f"refused: {report['error']}", file=sys.stderr)
-        else:
-            for row in report["results"]:
-                target = row.get("target") or {}
-                print(
-                    f"refused: {row.get('check_id')} {target.get('ip')}:{target.get('port')} "
-                    f"{row['provenance']['error']}",
-                    file=sys.stderr,
-                )
-        return 2
-    counts: dict[str, int] = {}
-    for row in report["results"]:
-        counts[row["status"]] = counts.get(row["status"], 0) + 1
-    # Exit 0 means the manifest was admitted and the checks ran.
-    # observed_weakness, lead, error, and not_tested also exit 0.
-    print(json.dumps({
-        "mode": "narrow-checks",
-        "output": str(outdir / "narrow-checks.json"),
-        "counts": counts,
-        "confirmed_exploit": False,
-    }))
-    return 0
+    # Exit 0 means the manifest was admitted and the checks ran, or a dry-run
+    # found no hard refusal. observed_weakness, lead, error, unreachable, and
+    # not_tested also exit 0. Exit 0 is not acceptance.
+    return narrow_checks.emit_narrow_report(report, outdir, include_mode=True)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -4454,8 +4466,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         conflicts = narrow_mode_conflicts(raw)
         if conflicts:
             print(
-                "error: --narrow-checks accepts only --manifest, --scope-check, "
-                "--admit, --authorized, and -o/--output. Refusing "
+                "error: --narrow-checks refuses this flag. Accepted flags are "
+                "--manifest, --scope-check, --admit, --authorized, -o/--output, "
+                "--dry-run, --narrow-workers, --narrow-rate, --narrow-connect-timeout, "
+                "--narrow-host-timeout, --narrow-min-prefix-v4, --narrow-min-prefix-v6, "
+                "--narrow-max-addresses, and --narrow-allow-broad-cidr. Refusing "
                 + ", ".join(conflicts)
                 + ".",
                 file=sys.stderr,
