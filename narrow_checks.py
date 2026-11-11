@@ -773,6 +773,21 @@ def run_row(
     return finished
 
 
+def refusal_reason(row: dict[str, Any], nets: list, admitted: set[tuple[str, int]]) -> Optional[str]:
+    """None when this row may be probed. Any other string is a hard refusal."""
+    if row.get("error"):
+        return str(row["error"])
+    host = str(row.get("host") or "")
+    port = row.get("port")
+    check = str(row.get("check") or "")
+    reason = admission_block(host, port if isinstance(port, int) else None, nets, admitted)
+    if reason:
+        return reason
+    if check not in {"tls", "ssh", "smb"}:
+        return f"unsupported check {check}"
+    return None
+
+
 def run_manifest(
     rows: list[dict[str, Any]],
     *,
@@ -788,6 +803,27 @@ def run_manifest(
     clock = now or datetime.now(timezone.utc)
     if clock.tzinfo is None:
         clock = clock.replace(tzinfo=timezone.utc)
+    refusals = []
+    if not rows:
+        refusals.append(_result("unknown", "", None, "not_tested", error="manifest has no checks"))
+    for row in rows:
+        reason = refusal_reason(row, nets, admitted)
+        if reason:
+            host = str(row.get("host") or "")
+            port = row.get("port") if isinstance(row.get("port"), int) else None
+            refusals.append(_result(str(row.get("check") or "unknown"), host, port, "not_tested", error=reason))
+    if refusals:
+        # No output directory and no tool process. One bad row refuses the whole manifest.
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "checks_version": CHECKS_VERSION,
+            "generated": _now_iso(),
+            "confirmed_exploit": False,
+            "refused": True,
+            "budgets": BUDGETS,
+            "limitations": {"tls": TLS_LIMITATION, "ssh": SSH_LIMITATION, "smb": SMB_LIMITATION},
+            "results": refusals,
+        }
     outdir.mkdir(parents=True, exist_ok=True)
     active = runner or SubprocessRunner()
     results = [
@@ -799,6 +835,7 @@ def run_manifest(
         "checks_version": CHECKS_VERSION,
         "generated": _now_iso(),
         "confirmed_exploit": False,
+        "refused": False,
         "budgets": BUDGETS,
         "limitations": {
             "tls": TLS_LIMITATION,
@@ -862,7 +899,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"missing file: {path}", file=sys.stderr)
             return 2
     rows = parse_manifest(manifest)
-    report = run_manifest(rows, scope_file=scope, admit_file=admit, outdir=Path(args.output))
+    outdir = Path(args.output)
+    report = run_manifest(rows, scope_file=scope, admit_file=admit, outdir=outdir)
+    if report.get("refused"):
+        for row in report["results"]:
+            print(f"refused: {row.get('check_id')} {row.get('target')} {row['provenance']['error']}", file=sys.stderr)
+        return 2
     counts: dict[str, int] = {}
     for row in report["results"]:
         counts[row["status"]] = counts.get(row["status"], 0) + 1

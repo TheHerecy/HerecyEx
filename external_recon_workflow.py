@@ -4135,6 +4135,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python3 external_recon_workflow.py -t scope.txt --phases passive,resolve,report --authorized\n"
             "  python3 external_recon_workflow.py -t scope.txt --scope-check allowlist.txt --authorized\n"
             "  python3 external_recon_workflow.py --resume results/20261110-090000 --phases web,services,report --authorized\n"
+            "  python3 external_recon_workflow.py --narrow-checks --manifest ssh.txt --scope-check scope.txt --admit admit.txt --authorized -o out\n"
         ),
     )
     p.add_argument("--targets", "-t", metavar="FILE", help="Target file (FQDNs, IPs, and/or CIDRs, one per line)")
@@ -4180,6 +4181,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="httpx / nuclei request rate (default: 50). Content discovery is capped at 30.")
     p.add_argument("--naabu-rate", type=int, default=1000,
                    help="naabu packets per second (default: 1000)")
+    p.add_argument("--narrow-checks", action="store_true",
+                   help="Run only admitted tls/ssh/smb checks from --manifest. Off by default. "
+                        "Not enabled by --quick. Requires --manifest, --scope-check, --admit, and --authorized.")
+    p.add_argument("--manifest", metavar="FILE",
+                   help="Narrow-check rows: tls|ssh|smb IP PORT. Used only with --narrow-checks.")
+    p.add_argument("--admit", metavar="FILE",
+                   help="Exact ip:port admissions. Used only with --narrow-checks. A bare IP is not enough.")
     p.add_argument("--version", action="version", version=f"HerecyEx {__version__}")
     return p
 
@@ -4337,9 +4345,104 @@ def write_run_meta(outdir: Path, args: argparse.Namespace, cfg: Config, tools: T
     write_text(outdir / "run-meta.json", json.dumps(meta, indent=2))
 
 
+# Tests inject these. Production leaves them unset so the real runner is used.
+_NARROW_RUNNER = None
+_NARROW_WHICH = None
+_NARROW_NOW = None
+
+
+def run_admitted_narrow_checks(args: argparse.Namespace) -> int:
+    """Opt-in path. Imports narrow_checks only after this module has finished loading."""
+    import narrow_checks as narrow_checks
+
+    manifest = Path(args.manifest)
+    scope = Path(args.scope_check)
+    admit = Path(args.admit)
+    for path in (manifest, scope, admit):
+        if not path.is_file():
+            print(f"error: missing file: {path}", file=sys.stderr)
+            return 2
+    rows = narrow_checks.parse_manifest(manifest)
+    report = narrow_checks.run_manifest(
+        rows,
+        scope_file=scope,
+        admit_file=admit,
+        outdir=Path(args.output),
+        runner=_NARROW_RUNNER,
+        which=_NARROW_WHICH or shutil.which,
+        now=_NARROW_NOW,
+    )
+    if report.get("refused"):
+        for row in report["results"]:
+            target = row.get("target") or {}
+            print(
+                f"refused: {row.get('check_id')} {target.get('ip')}:{target.get('port')} "
+                f"{row['provenance']['error']}",
+                file=sys.stderr,
+            )
+        return 2
+    counts: dict[str, int] = {}
+    for row in report["results"]:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    print(json.dumps({
+        "mode": "narrow-checks",
+        "output": str(Path(args.output) / "narrow-checks.json"),
+        "counts": counts,
+        "confirmed_exploit": False,
+    }))
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.narrow_checks:
+        blocked = []
+        if args.quick:
+            blocked.append("--quick")
+        if args.full:
+            blocked.append("--full")
+        if args.phases != "all":
+            blocked.append("--phases")
+        if args.resume:
+            blocked.append("--resume")
+        if args.targets:
+            blocked.append("--targets")
+        if args.no_active:
+            blocked.append("--no-active")
+        if args.udp:
+            blocked.append("--udp")
+        if args.nikto:
+            blocked.append("--nikto")
+        if args.direnum:
+            blocked.append("--direnum")
+        if args.full_ports:
+            blocked.append("--full-ports")
+        if args.allow_intrusive_checks:
+            blocked.append("--allow-intrusive-checks")
+        if args.testssl:
+            blocked.append("--testssl")
+        if args.check_tools:
+            blocked.append("--check-tools")
+        if blocked:
+            print(
+                "error: --narrow-checks does not run recon phases. Refusing "
+                + ", ".join(blocked)
+                + ".",
+                file=sys.stderr,
+            )
+            return 2
+        if not args.manifest or not args.scope_check or not args.admit:
+            print(
+                "error: --narrow-checks requires --manifest, --scope-check, and --admit.",
+                file=sys.stderr,
+            )
+            return 2
+        if not confirm_authorized(args.authorized):
+            print("Aborted — authorization not confirmed.", file=sys.stderr)
+            return 3
+        return run_admitted_narrow_checks(args)
 
     _bootstrap_path()
     banner()

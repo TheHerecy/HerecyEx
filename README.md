@@ -274,7 +274,23 @@ python3 external_recon_workflow.py \
 
 ## Narrow checks
 
-`narrow_checks.py` is a separate entry point. It is the acceptance command for TLS config, SSH algorithms, and SMB2 signing. The `--quick` all-phase run is not that acceptance.
+`narrow_checks.py` remains a standalone entry point with the same gates. The main command can run the same checks only when `--narrow-checks` is explicit. `--quick` does not turn that mode on, and `--narrow-checks --quick` is refused before any process starts. The next SSH fixture acceptance command is the main entry point, not the all-phase workflow:
+
+```bash
+python3 external_recon_workflow.py \
+  --narrow-checks \
+  --manifest /path/ssh-manifest.txt \
+  --scope-check /path/ssh-scope.txt \
+  --admit /path/ssh-admit.txt \
+  --authorized \
+  -o /path/ssh-out
+```
+
+`ssh-manifest.txt` contains exactly two rows, `ssh FIXTURE_SSH_WEAK 22` and `ssh FIXTURE_SSH_HARD 22`. `ssh-admit.txt` contains only those two `IP:22` lines. `ssh-scope.txt` contains only those two IPs. One bad row refuses the whole manifest: no output directory and no `ssh-audit` process. A completed run writes `narrow-checks.json` and starts no recon phase. Network traffic is one `ssh-audit` connection per admitted row (30 second process budget, internal `-t 10`). Each row also runs local `ssh-audit -V` (10 seconds, no network). No nmap, sslscan, nuclei, or httpx process is started for an SSH-only manifest.
+
+The Nov 11 narrow-entrypoint result, not this integration, was: group1 KEX plus hmac-sha1 with ssh-audit exit 3 is `observed_weakness`; a modern control with exit 0 is `observed_no_weakness`. Cipher findings are not part of that live evidence. `lead` and `error` are never reported as `observed_no_weakness`.
+
+`narrow_checks.py` is a separate entry point with the same admission rules. The `--quick` all-phase run is not acceptance for these checks.
 
 A row is probed only when all of these are true: the manifest says `tls`, `ssh`, or `smb`, the token is an IP, the port is an integer, the IP is inside `--scope-check`, and the exact `IP:port` is in `--admit`. A hostname, a bare IP with no port, or a port that is not admitted is `not_tested` and no probe process is started.
 
