@@ -272,6 +272,67 @@ python3 external_recon_workflow.py \
   -o ./results
 ```
 
+## Narrow checks
+
+`narrow_checks.py` is a separate entry point. It is the acceptance command for TLS config, SSH algorithms, and SMB2 signing. The `--quick` all-phase run is not that acceptance.
+
+A row is probed only when all of these are true: the manifest says `tls`, `ssh`, or `smb`, the token is an IP, the port is an integer, the IP is inside `--scope-check`, and the exact `IP:port` is in `--admit`. A hostname, a bare IP with no port, or a port that is not admitted is `not_tested` and no probe process is started.
+
+```bash
+python3 narrow_checks.py \
+  --manifest /path/manifest.txt \
+  --scope-check /path/scope.txt \
+  --admit /path/admit.txt \
+  --authorized \
+  -o /path/out
+```
+
+Manifest lines are `CHECK IP PORT`. Admit lines are `IP:port` or `[IPv6]:port`. `--authorized` is required when stdin is not a TTY; otherwise the process exits 3 and does not create the output directory.
+
+Checked argv, after a local version probe (`sslscan --version`, `ssh-audit -V`, or `nmap --version`, 10 second budget):
+
+```text
+sslscan --no-colour --no-heartbleed --no-compression --no-renegotiation --no-fallback --no-groups --show-certificate --connect-timeout=10 --timeout=5 --xml=ARTIFACT IP:PORT
+ssh-audit -n -p PORT -t 10 --skip-rate-test IP
+nmap -Pn -n -p PORT --script smb2-security-mode --script-timeout 20s -oN ARTIFACT IP
+```
+
+Process budgets are 90 seconds for sslscan, 30 for ssh-audit, and 45 for nmap. testssl is not started. Heartbleed, CRIME, renegotiation, and fallback checks are switched off in sslscan 2.1.5. ssh-audit is not passed `-c`, `--dheat`, `-g`, or `-T`. ssh-auth-methods is not used. The nmap script list is only `smb2-security-mode`.
+
+Statuses are `observed_weakness`, `observed_no_weakness`, `lead`, `not_tested`, and `error`. `observed_no_weakness` means the check finished, the required section was present, and the weakness pattern was absent. It does not mean the host is clean. Timeout, a missing tool, a non-zero exit without a positive weakness, truncated output, and a parse failure are `error` or `not_tested`, never `observed_no_weakness`. `confirmed_exploit` stays false. Each result records the IP, port, transport, check id, checker version, tool name and version, argv, start and finish timestamps, exit code, timeout flag, source path, sha256 of the redacted artifact, and a short snippet. Private-key blocks are redacted before the artifact is written.
+
+Offline parser fixtures are not live results. Terrifier's OpenSSL 3.6.5 has MinProtocol TLSv1.2, SECLEVEL 2, and SSL3 compiled out, so sslscan 2.1.5 may be unable to offer TLS 1.0 or SSLv3. OpenSSH 10.5p1 may be unable to offer a key-exchange or MAC that ssh-audit 3.3.0 marks `[fail]`. Those positives have not been produced on a host. Samba 4.25.0 signing policy is the check most likely to be observable later, and it has not been deployed.
+
+Do not deploy the following. It is the approval proposal only, using existing binaries inside a network namespace with veth and nftables, not a container. Placeholders are not real addresses.
+
+```text
+# scope.txt
+FIXTURE_TLS_WEAK
+FIXTURE_TLS_HARD
+FIXTURE_SSH_WEAK
+FIXTURE_SSH_HARD
+FIXTURE_SMB_OPTIONAL
+FIXTURE_SMB_REQUIRED
+
+# admit.txt
+FIXTURE_TLS_WEAK:443
+FIXTURE_TLS_HARD:443
+FIXTURE_SSH_WEAK:22
+FIXTURE_SSH_HARD:22
+FIXTURE_SMB_OPTIONAL:445
+FIXTURE_SMB_REQUIRED:445
+
+# manifest.txt
+tls FIXTURE_TLS_WEAK 443
+tls FIXTURE_TLS_HARD 443
+ssh FIXTURE_SSH_WEAK 22
+ssh FIXTURE_SSH_HARD 22
+smb FIXTURE_SMB_OPTIONAL 445
+smb FIXTURE_SMB_REQUIRED 445
+```
+
+Expected statuses after an approved run, not observed yet: TLS weak is `observed_weakness` only if this OpenSSL build can complete the weak handshake; otherwise the result is `error` or a false `observed_no_weakness` and the fixture is invalid. TLS hard, if the scan completes and the certificate date parses, is `observed_no_weakness`. SSH weak is `observed_weakness` only when ssh-audit prints `[fail]` on a `(kex)` or `(mac)` line. SSH hard with only `[info]` lines and exit 0 is `observed_no_weakness`. SMB optional (`server signing = auto` or equivalent, "enabled but not required") is `observed_weakness`. SMB required (`server signing = mandatory`, exact sentence `Message signing enabled and required`) is `observed_no_weakness`. One address that is not in `scope.txt` and one admitted IP with a port absent from `admit.txt` must stay `not_tested` with an empty argv.
+
 ## Legal
 
 Only use this against systems you have written authorization to test. You are responsible for the contents of `--targets` and `--scope-check`. Findings of interest are recon leads, not proof of a vulnerability and not proof of exploitability.
