@@ -1,5 +1,15 @@
-# Sample targets file for external recon workflow
-# One domain or IP per line. Lines starting with # are ignored.
+# HerecyEx target file
+# One token per line. Blank lines, # comments, commas, and duplicates are fine.
+# Mix FQDNs, IPv4, IPv6, CIDRs, and URLs (scheme and path are stripped).
+# Only list systems you have written authorization to test.
+# Addresses below are documentation examples (RFC 2606 / RFC 3849 / RFC 5737).
+
 example.com
-scanme.nmap.org
-# 192.0.2.1
+www.example.com
+https://staging.example.com/login
+203.0.113.10
+203.0.113.0/29
+2001:db8::10
+
+# scanme.nmap.org is a public demo host. Uncomment only if you intend to use it.
+# scanme.nmap.org

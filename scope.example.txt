@@ -1,0 +1,11 @@
+# HerecyEx scope allowlist
+# Pass with: --scope-check scope.example.txt
+# CIDRs, single IPs, and domain suffixes. Anything that does not match is dropped
+# and written to targets/dropped-out-of-scope.txt.
+# A domain suffix matches that name and any hostname under it.
+# Resolved addresses are kept only when they fall inside a listed network,
+# if the allowlist contains any networks.
+
+example.com
+203.0.113.0/24
+2001:db8::/32
