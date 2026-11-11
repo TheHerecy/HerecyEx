@@ -27,7 +27,7 @@ from xml.etree import ElementTree
 
 import external_recon_workflow as hx
 
-CHECKS_VERSION = "1.0.0"
+CHECKS_VERSION = "1.0.1"
 SCHEMA_VERSION = "1"
 
 # Process budgets. sslscan's own --timeout and --connect-timeout are inside the process budget.
@@ -144,6 +144,54 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
 
 
+class NarrowInputError(Exception):
+    """Malformed scope or admit input. Callers turn this into exit 2."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+def load_narrow_scope(path: Path) -> list:
+    """Bare IPs and canonical CIDRs. Host bits are not masked.
+
+    A bare IP is that host (/32 or /128). A CIDR is accepted only when
+    ``ipaddress.ip_network(line, strict=True)`` accepts it, so the written
+    address is already the network address. ``203.0.113.10/0`` and
+    ``203.0.113.10/24`` are rejected. They are not rewritten to
+    ``0.0.0.0/0`` or ``203.0.113.0/24``.
+
+    The broad recon loader still uses strict=False. This function is only
+    for narrow checks. A domain suffix is not a network and does not admit
+    an address.
+    """
+    nets = []
+    errors = []
+    text = path.read_text(encoding="utf-8", errors="replace")
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if "/" in line:
+            try:
+                nets.append(ipaddress.ip_network(line, strict=True))
+            except ValueError:
+                errors.append(
+                    f"line {lineno}: scope CIDR must be canonical (network address and prefix), not {line!r}"
+                )
+            continue
+        try:
+            ip = ipaddress.ip_address(line)
+        except ValueError:
+            continue
+        nets.append(ipaddress.ip_network(ip))
+    if errors:
+        raise NarrowInputError(
+            "scope file rejected; non-canonical CIDRs are not widened. " + "; ".join(errors)
+        )
+    return nets
+
+
 def parse_admit(path: Path) -> set[tuple[str, int]]:
     """Exact ip:port admissions. A bare IP or a hostname is rejected."""
     admitted: set[tuple[str, int]] = set()
@@ -153,7 +201,7 @@ def parse_admit(path: Path) -> set[tuple[str, int]]:
             continue
         ip, port = _split_ip_port(line)
         if ip is None or port is None:
-            raise SystemExit(f"admit line must be ip:port, not {line!r}")
+            raise NarrowInputError(f"admit line must be ip:port, not {line!r}")
         admitted.add((ip, port))
     return admitted
 
@@ -798,8 +846,14 @@ def run_manifest(
     now: Optional[datetime] = None,
     which=shutil.which,
 ) -> dict[str, Any]:
-    nets, _suffixes = hx.load_scope(scope_file)
-    admitted = parse_admit(admit_file)
+    try:
+        nets = load_narrow_scope(scope_file)
+        admitted = parse_admit(admit_file)
+    except NarrowInputError as exc:
+        # No output directory and no tool. Bad admit used to raise SystemExit.
+        return _refused_report([
+            _result("unknown", "", None, "not_tested", error=exc.message),
+        ], error=exc.message)
     clock = now or datetime.now(timezone.utc)
     if clock.tzinfo is None:
         clock = clock.replace(tzinfo=timezone.utc)
@@ -814,16 +868,7 @@ def run_manifest(
             refusals.append(_result(str(row.get("check") or "unknown"), host, port, "not_tested", error=reason))
     if refusals:
         # No output directory and no tool process. One bad row refuses the whole manifest.
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "checks_version": CHECKS_VERSION,
-            "generated": _now_iso(),
-            "confirmed_exploit": False,
-            "refused": True,
-            "budgets": BUDGETS,
-            "limitations": {"tls": TLS_LIMITATION, "ssh": SSH_LIMITATION, "smb": SMB_LIMITATION},
-            "results": refusals,
-        }
+        return _refused_report(refusals)
     outdir.mkdir(parents=True, exist_ok=True)
     active = runner or SubprocessRunner()
     results = [
@@ -849,6 +894,22 @@ def run_manifest(
     return report
 
 
+def _refused_report(results: list[dict[str, Any]], error: str = "") -> dict[str, Any]:
+    report = {
+        "schema_version": SCHEMA_VERSION,
+        "checks_version": CHECKS_VERSION,
+        "generated": _now_iso(),
+        "confirmed_exploit": False,
+        "refused": True,
+        "budgets": BUDGETS,
+        "limitations": {"tls": TLS_LIMITATION, "ssh": SSH_LIMITATION, "smb": SMB_LIMITATION},
+        "results": results,
+    }
+    if error:
+        report["error"] = error
+    return report
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="narrow_checks.py",
@@ -859,7 +920,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--manifest", required=True, help="Lines: tls|ssh|smb IP PORT")
-    parser.add_argument("--scope-check", required=True, help="IP/CIDR allowlist. The IP must fall inside it.")
+    parser.add_argument(
+        "--scope-check",
+        required=True,
+        help="Bare IPs and canonical CIDRs. A non-canonical CIDR such as 203.0.113.10/0 is rejected and is not widened.",
+    )
     parser.add_argument("--admit", required=True, help="Exact ip:port lines. A bare IP is not enough.")
     parser.add_argument("-o", "--output", required=True, help="Output directory for narrow-checks.json and artifacts")
     parser.add_argument("--authorized", action="store_true", help="Confirm written authorization for every admitted socket")
@@ -899,16 +964,23 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"missing file: {path}", file=sys.stderr)
             return 2
     rows = parse_manifest(manifest)
-    outdir = Path(args.output)
+    outdir = Path(args.output).expanduser()
     report = run_manifest(rows, scope_file=scope, admit_file=admit, outdir=outdir)
     if report.get("refused"):
-        for row in report["results"]:
-            print(f"refused: {row.get('check_id')} {row.get('target')} {row['provenance']['error']}", file=sys.stderr)
+        if report.get("error"):
+            print(f"refused: {report['error']}", file=sys.stderr)
+        else:
+            for row in report["results"]:
+                print(
+                    f"refused: {row.get('check_id')} {row.get('target')} {row['provenance']['error']}",
+                    file=sys.stderr,
+                )
         return 2
     counts: dict[str, int] = {}
     for row in report["results"]:
         counts[row["status"]] = counts.get(row["status"], 0) + 1
-    print(json.dumps({"output": str(Path(args.output) / "narrow-checks.json"), "counts": counts}))
+    # Exit 0 means the manifest was admitted. It is also the exit for a weakness.
+    print(json.dumps({"output": str(outdir / "narrow-checks.json"), "counts": counts}))
     return 0
 
 

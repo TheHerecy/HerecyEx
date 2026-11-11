@@ -207,6 +207,88 @@ def test_refusals_create_no_directory_and_no_tool():
             assert not out.exists()
 
 
+def test_explicit_defaults_noncanonical_scope_and_bad_admit():
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        manifest, scope, admit = write_pair(tmp)
+        out = tmp / "out"
+        (out).mkdir()
+        (out / "sentinel.txt").write_text("keep")
+        runner = MapRunner({})
+        hx._NARROW_RUNNER = runner
+        hx._NARROW_WHICH = lambda name: "/usr/bin/ssh-audit"
+        cases = [
+            ["--phases", "all"],
+            ["--threads", "8"],
+            ["--timeout", "300"],
+            ["--rate", "0"],
+            ["--http-rate", "50"],
+            ["--naabu-rate", "1000"],
+            ["--max-cidr-hosts", "4096"],
+            ["--alive-only"],
+            ["--nmap-timing", "9"],
+            ["--nuclei-severity", "high"],
+            ["--wordlist", "missing-list"],
+            ["--force"],
+            ["--no-nuclei"],
+            ["--no-direnum"],
+            ["--phases=all"],
+            ["--threads=8"],
+        ]
+        try:
+            for extra in cases:
+                code = hx.main(argv_for(out, manifest, scope, admit, extra=extra))
+                assert code == 2, (extra, code)
+                assert runner.calls == []
+                assert (out / "sentinel.txt").read_text() == "keep"
+                assert not (out / "narrow-checks.json").exists()
+        finally:
+            hx._NARROW_RUNNER = hx._NARROW_WHICH = None
+
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        manifest = tmp / "m.txt"
+        scope = tmp / "s.txt"
+        admit = tmp / "a.txt"
+        manifest.write_text(f"ssh {WEAK} 22\nssh 198.51.100.5 22\n")
+        scope.write_text("203.0.113.10/0\n")
+        admit.write_text(f"{WEAK}:22\n198.51.100.5:22\n")
+        out = tmp / "out"
+        runner = MapRunner({})
+        hx._NARROW_RUNNER = runner
+        try:
+            code = hx.main(argv_for(out, manifest, scope, admit))
+        finally:
+            hx._NARROW_RUNNER = None
+        assert code == 2
+        assert runner.calls == []
+        assert not out.exists()
+        widened = hx.parse_network("203.0.113.10/0")
+        assert str(widened) == "0.0.0.0/0"
+        try:
+            nc.load_narrow_scope(scope)
+        except nc.NarrowInputError as exc:
+            assert "203.0.113.10/0" in exc.message
+        else:
+            raise AssertionError("non-canonical scope was accepted")
+
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        manifest, scope, _admit = write_pair(tmp)
+        bad = tmp / "bad-admit.txt"
+        bad.write_text(f"{WEAK}\n")
+        out = tmp / "out"
+        runner = MapRunner({})
+        hx._NARROW_RUNNER = runner
+        try:
+            code = hx.main(argv_for(out, manifest, scope, bad))
+        finally:
+            hx._NARROW_RUNNER = None
+        assert code == 2
+        assert runner.calls == []
+        assert not out.exists()
+
+
 def test_unauthorized_main_exits_3():
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
@@ -224,6 +306,7 @@ def main() -> int:
         test_lead_and_error_are_not_negatives,
         test_quick_does_not_enable_narrow_and_combination_is_refused,
         test_refusals_create_no_directory_and_no_tool,
+        test_explicit_defaults_noncanonical_scope_and_bad_admit,
         test_unauthorized_main_exits_3,
     ]
     failed = 0

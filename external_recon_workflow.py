@@ -917,6 +917,11 @@ def is_ip(value: str) -> bool:
 
 
 def parse_network(value: str) -> Optional[ipaddress._BaseNetwork]:
+    """Broad recon loader. Host bits are masked on purpose (strict=False).
+
+    ``203.0.113.10/0`` becomes ``0.0.0.0/0`` here. Narrow checks do not use
+    this function. Their scope loader rejects that line instead of widening it.
+    """
     try:
         return ipaddress.ip_network(value, strict=False)
     except Exception:
@@ -4183,7 +4188,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="naabu packets per second (default: 1000)")
     p.add_argument("--narrow-checks", action="store_true",
                    help="Run only admitted tls/ssh/smb checks from --manifest. Off by default. "
-                        "Not enabled by --quick. Requires --manifest, --scope-check, --admit, and --authorized.")
+                        "Not enabled by --quick. The only other flags accepted are --manifest, "
+                        "--scope-check, --admit, --authorized, and -o/--output. Any other flag, "
+                        "including one typed at its usual default, is refused before any tool "
+                        "or output directory.")
     p.add_argument("--manifest", metavar="FILE",
                    help="Narrow-check rows: tls|ssh|smb IP PORT. Used only with --narrow-checks.")
     p.add_argument("--admit", metavar="FILE",
@@ -4346,9 +4354,47 @@ def write_run_meta(outdir: Path, args: argparse.Namespace, cfg: Config, tools: T
 
 
 # Tests inject these. Production leaves them unset so the real runner is used.
+# A script run does not see injections made on an imported copy of this module.
 _NARROW_RUNNER = None
 _NARROW_WHICH = None
 _NARROW_NOW = None
+
+# Anything else on the argv, even when the value equals the usual default, is a
+# recon option and is refused. --phases all and --threads 8 are not exempt.
+_NARROW_BARE_OPTIONS = {"--narrow-checks", "--authorized"}
+_NARROW_VALUE_OPTIONS = {"--manifest", "--scope-check", "--admit", "--output", "-o"}
+
+
+def narrow_mode_conflicts(argv: list[str]) -> list[str]:
+    """Flags that must not appear on a --narrow-checks command."""
+    conflicts: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        name = token
+        attached = False
+        if token.startswith("--") and "=" in token:
+            name = token.split("=", 1)[0]
+            attached = True
+        elif token.startswith("-o") and not token.startswith("--") and token != "-o":
+            name = "-o"
+            attached = True
+        if name in _NARROW_BARE_OPTIONS or (attached and name in _NARROW_VALUE_OPTIONS):
+            index += 1
+            continue
+        if name in _NARROW_VALUE_OPTIONS:
+            index += 2 if index + 1 < len(argv) else 1
+            continue
+        if token.startswith("-"):
+            conflicts.append(name)
+            if not attached and index + 1 < len(argv) and not str(argv[index + 1]).startswith("-"):
+                index += 2
+            else:
+                index += 1
+            continue
+        conflicts.append(token)
+        index += 1
+    return conflicts
 
 
 def run_admitted_narrow_checks(args: argparse.Namespace) -> int:
@@ -4363,30 +4409,36 @@ def run_admitted_narrow_checks(args: argparse.Namespace) -> int:
             print(f"error: missing file: {path}", file=sys.stderr)
             return 2
     rows = narrow_checks.parse_manifest(manifest)
+    outdir = Path(args.output).expanduser()
     report = narrow_checks.run_manifest(
         rows,
         scope_file=scope,
         admit_file=admit,
-        outdir=Path(args.output),
+        outdir=outdir,
         runner=_NARROW_RUNNER,
         which=_NARROW_WHICH or shutil.which,
         now=_NARROW_NOW,
     )
     if report.get("refused"):
-        for row in report["results"]:
-            target = row.get("target") or {}
-            print(
-                f"refused: {row.get('check_id')} {target.get('ip')}:{target.get('port')} "
-                f"{row['provenance']['error']}",
-                file=sys.stderr,
-            )
+        if report.get("error"):
+            print(f"refused: {report['error']}", file=sys.stderr)
+        else:
+            for row in report["results"]:
+                target = row.get("target") or {}
+                print(
+                    f"refused: {row.get('check_id')} {target.get('ip')}:{target.get('port')} "
+                    f"{row['provenance']['error']}",
+                    file=sys.stderr,
+                )
         return 2
     counts: dict[str, int] = {}
     for row in report["results"]:
         counts[row["status"]] = counts.get(row["status"], 0) + 1
+    # Exit 0 means the manifest was admitted and the checks ran.
+    # observed_weakness, lead, error, and not_tested also exit 0.
     print(json.dumps({
         "mode": "narrow-checks",
-        "output": str(Path(args.output) / "narrow-checks.json"),
+        "output": str(outdir / "narrow-checks.json"),
         "counts": counts,
         "confirmed_exploit": False,
     }))
@@ -4398,37 +4450,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     if args.narrow_checks:
-        blocked = []
-        if args.quick:
-            blocked.append("--quick")
-        if args.full:
-            blocked.append("--full")
-        if args.phases != "all":
-            blocked.append("--phases")
-        if args.resume:
-            blocked.append("--resume")
-        if args.targets:
-            blocked.append("--targets")
-        if args.no_active:
-            blocked.append("--no-active")
-        if args.udp:
-            blocked.append("--udp")
-        if args.nikto:
-            blocked.append("--nikto")
-        if args.direnum:
-            blocked.append("--direnum")
-        if args.full_ports:
-            blocked.append("--full-ports")
-        if args.allow_intrusive_checks:
-            blocked.append("--allow-intrusive-checks")
-        if args.testssl:
-            blocked.append("--testssl")
-        if args.check_tools:
-            blocked.append("--check-tools")
-        if blocked:
+        raw = list(sys.argv[1:] if argv is None else argv)
+        conflicts = narrow_mode_conflicts(raw)
+        if conflicts:
             print(
-                "error: --narrow-checks does not run recon phases. Refusing "
-                + ", ".join(blocked)
+                "error: --narrow-checks accepts only --manifest, --scope-check, "
+                "--admit, --authorized, and -o/--output. Refusing "
+                + ", ".join(conflicts)
                 + ".",
                 file=sys.stderr,
             )
@@ -4439,6 +4467,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                 file=sys.stderr,
             )
             return 2
+        for label, value in (("--manifest", args.manifest), ("--scope-check", args.scope_check), ("--admit", args.admit)):
+            if not Path(value).is_file():
+                print(f"error: missing file for {label}: {value}", file=sys.stderr)
+                return 2
         if not confirm_authorized(args.authorized):
             print("Aborted — authorization not confirmed.", file=sys.stderr)
             return 3

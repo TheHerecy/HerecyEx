@@ -274,7 +274,9 @@ python3 external_recon_workflow.py \
 
 ## Narrow checks
 
-`narrow_checks.py` remains a standalone entry point with the same gates. The main command can run the same checks only when `--narrow-checks` is explicit. `--quick` does not turn that mode on, and `--narrow-checks --quick` is refused before any process starts. The next SSH fixture acceptance command is the main entry point, not the all-phase workflow:
+`--narrow-checks` on `external_recon_workflow.py` is off unless that flag is present. `--quick` does not enable it. `narrow_checks.py` remains a standalone entry point with the same admission, scope, and classifiers. An older standalone lab pair does not prove the main command. This section is the offline contract, not a live acceptance.
+
+The main command accepts only `--narrow-checks`, `--manifest`, `--scope-check`, `--admit`, `--authorized`, and `-o` / `--output`. Any other flag is exit 2 before authorization, before the output directory, and before a tool lookup. That includes a flag typed at its usual default: `--phases all`, `--threads 8`, `--timeout 300`, `--rate 0`, `--http-rate 50`, `--naabu-rate 1000`, and `--max-cidr-hosts 4096`. It also includes `--alive-only`, `--nmap-timing` (any value, including `9`), `--nuclei-severity`, `--wordlist`, `--force`, `--no-nuclei`, and `--no-direnum`.
 
 ```bash
 python3 external_recon_workflow.py \
@@ -286,13 +288,19 @@ python3 external_recon_workflow.py \
   -o /path/ssh-out
 ```
 
-`ssh-manifest.txt` contains exactly two rows, `ssh FIXTURE_SSH_WEAK 22` and `ssh FIXTURE_SSH_HARD 22`. `ssh-admit.txt` contains only those two `IP:22` lines. `ssh-scope.txt` contains only those two IPs. One bad row refuses the whole manifest: no output directory and no `ssh-audit` process. A completed run writes `narrow-checks.json` and starts no recon phase. Network traffic is one `ssh-audit` connection per admitted row (30 second process budget, internal `-t 10`). Each row also runs local `ssh-audit -V` (10 seconds, no network). No nmap, sslscan, nuclei, or httpx process is started for an SSH-only manifest.
+`-o` is the output directory itself. Narrow mode does not create the timestamped subdirectory used by the broad workflow. `~` is expanded. If `-o` is omitted, the directory is `results` in the working directory (`results/narrow-checks.json` and `results/artifacts/`). Standalone `narrow_checks.py` still requires `-o`.
 
-The Nov 11 narrow-entrypoint result, not this integration, was: group1 KEX plus hmac-sha1 with ssh-audit exit 3 is `observed_weakness`; a modern control with exit 0 is `observed_no_weakness`. Cipher findings are not part of that live evidence. `lead` and `error` are never reported as `observed_no_weakness`.
+Exit 0 means every row was admitted and the checks ran. It does not mean the hosts are clean, and it is not fixture acceptance. `observed_weakness`, `lead`, `error`, and `not_tested` (the tool is missing after a valid manifest) also exit 0. Exit 2 is a refusal: an incompatible flag, a missing file, a bad manifest row, a bad admit line, or a non-canonical scope CIDR. The output directory is not created and no tool is looked up. Exit 3 is a non-interactive run without `--authorized`. No directory is created.
 
-`narrow_checks.py` is a separate entry point with the same admission rules. The `--quick` all-phase run is not acceptance for these checks.
+Stdout is not a JSON document. It is the authorization text, an OK log line, then one JSON object. The main command's object is `{"mode":"narrow-checks","output":".../narrow-checks.json","counts":{...},"confirmed_exploit":false}`. The standalone object has `output` and `counts` only. Counts may include `observed_weakness`.
 
-A row is probed only when all of these are true: the manifest says `tls`, `ssh`, or `smb`, the token is an IP, the port is an integer, the IP is inside `--scope-check`, and the exact `IP:port` is in `--admit`. A hostname, a bare IP with no port, or a port that is not admitted is `not_tested` and no probe process is started.
+Scope semantics for this mode only: a bare IP allows that host (`/32` or `/128`). A CIDR is allowed only when the written address is already the network address (`203.0.113.0/24`, `203.0.113.10/32`). `203.0.113.10/24` and `203.0.113.10/0` are rejected and are not rewritten to `203.0.113.0/24` or `0.0.0.0/0`. One rejected line refuses the whole file. A domain suffix is not a network and does not admit an address. The broad recon loader still uses non-strict CIDR parsing; this rejection is not applied there.
+
+`ssh-manifest.txt` for a later SSH acceptance contains exactly `ssh FIXTURE_SSH_WEAK 22` and `ssh FIXTURE_SSH_HARD 22`. Admit lines are only those two `IP:22` pairs. Scope lines are only those two bare IPs. A prefixed scope line is a different gate. One bad row refuses the whole manifest. If that later run is authorized, network traffic is one `ssh-audit` connection per admitted row (`-n -p PORT -t 10 --skip-rate-test IP`, 30 second process budget) plus a local `ssh-audit -V` (10 seconds). No nmap, sslscan, nuclei, httpx, dnsx, or dig process starts for an SSH-only manifest.
+
+The Nov 11 narrow-entrypoint result was not a main-command run: group1 KEX plus hmac-sha1 with ssh-audit exit 3 is `observed_weakness`; a modern control with exit 0 is `observed_no_weakness`. Cipher findings are not part of that live evidence. `lead` and `error` are never `observed_no_weakness`. A complete report with exit 3 and no `[fail]` line is `error`. A `[warn]` line stays `lead` when the exit code is 3.
+
+A row is probed only when all of these are true: the manifest says `tls`, `ssh`, or `smb`, the token is an IP, the port is an integer, the IP is inside a bare IP or a canonical CIDR in `--scope-check`, and the exact `IP:port` is in `--admit`. A hostname, a bad admit line, a non-canonical CIDR, or a port that is not admitted refuses the whole manifest before any probe process starts.
 
 ```bash
 python3 narrow_checks.py \
@@ -347,7 +355,7 @@ smb FIXTURE_SMB_OPTIONAL 445
 smb FIXTURE_SMB_REQUIRED 445
 ```
 
-Expected statuses after an approved run, not observed yet: TLS weak is `observed_weakness` only if this OpenSSL build can complete the weak handshake; otherwise the result is `error` or a false `observed_no_weakness` and the fixture is invalid. TLS hard, if the scan completes and the certificate date parses, is `observed_no_weakness`. SSH weak is `observed_weakness` only when ssh-audit prints `[fail]` on a `(kex)` or `(mac)` line. SSH hard with only `[info]` lines and exit 0 is `observed_no_weakness`. SMB optional (`server signing = auto` or equivalent, "enabled but not required") is `observed_weakness`. SMB required (`server signing = mandatory`, exact sentence `Message signing enabled and required`) is `observed_no_weakness`. One address that is not in `scope.txt` and one admitted IP with a port absent from `admit.txt` must stay `not_tested` with an empty argv.
+Expected statuses after an approved run, not observed yet: TLS weak is `observed_weakness` only if this OpenSSL build can complete the weak handshake; otherwise the result is `error` or a false `observed_no_weakness` and the fixture is invalid. TLS hard, if the scan completes and the certificate date parses, is `observed_no_weakness`. SSH weak is `observed_weakness` only when ssh-audit prints `[fail]` on a `(kex)` or `(mac)` line. SSH hard with only `[info]` lines and exit 0 is `observed_no_weakness`. SMB optional (`server signing = auto` or equivalent, "enabled but not required") is `observed_weakness`. SMB required (`server signing = mandatory`, exact sentence `Message signing enabled and required`) is `observed_no_weakness`. A manifest that includes an address outside the scope file, or an IP with a port absent from the admit file, exits 2 before any probe and does not create the output directory.
 
 ## Legal
 
