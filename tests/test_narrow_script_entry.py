@@ -255,9 +255,17 @@ def test_broad_loader_still_widens_and_narrow_loader_rejects():
         else:
             raise AssertionError("narrow loader accepted a non-canonical CIDR")
         canonical = Path(raw) / "canonical.txt"
-        canonical.write_text("203.0.113.0/24\n203.0.113.10\n2001:db8::/32\n")
+        canonical.write_text("203.0.113.0/24\n203.0.113.10\n")
         loaded = nc.load_narrow_scope(canonical)
-        assert {str(net) for net in loaded} == {"203.0.113.0/24", "203.0.113.10/32", "2001:db8::/32"}
+        assert {str(net) for net in loaded} == {"203.0.113.0/24", "203.0.113.10/32"}
+        broad_v6 = Path(raw) / "broad-v6.txt"
+        broad_v6.write_text("2001:db8::/32\n")
+        try:
+            nc.load_narrow_scope(broad_v6)
+        except nc.NarrowInputError as exc:
+            assert "2001:db8::/32" in exc.message
+        else:
+            raise AssertionError("load_narrow_scope accepted an uncapped IPv6 prefix")
         hostbits = Path(raw) / "hostbits.txt"
         hostbits.write_text("2001:db8::1/32\n")
         try:

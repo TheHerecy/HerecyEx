@@ -106,12 +106,20 @@ class ScriptRunner:
         return [argv for argv, _timeout in self.calls if "-V" not in argv and "--version" not in argv]
 
 
-def test_load_narrow_scope_still_accepts_documentation_prefix_without_caps():
+def test_load_narrow_scope_uses_the_same_caps_as_a_run():
     with tempfile.TemporaryDirectory() as raw:
         scope = Path(raw) / "scope.txt"
-        scope.write_text("203.0.113.0/24\n203.0.113.10\n2001:db8::/32\n")
+        scope.write_text("203.0.113.0/24\n203.0.113.10\n")
         loaded = nc.load_narrow_scope(scope)
-        assert {str(net) for net in loaded} == {"203.0.113.0/24", "203.0.113.10/32", "2001:db8::/32"}
+        assert {str(net) for net in loaded} == {"203.0.113.0/24", "203.0.113.10/32"}
+        broad = Path(raw) / "broad.txt"
+        broad.write_text("2001:db8::/32\n")
+        try:
+            nc.load_narrow_scope(broad)
+        except nc.NarrowInputError as exc:
+            assert "2001:db8::/32" in exc.message
+        else:
+            raise AssertionError("load_narrow_scope accepted an uncapped prefix")
 
 
 def test_slash_zero_and_broad_cidrs_fail_closed():
@@ -459,7 +467,8 @@ def test_probe_count_is_bounded_per_host_and_in_total():
         probes = runner.probes()
         assert len(probes) == len(hosts)
         assert report["probe_accounting"]["probes_started"] == len(hosts)
-        assert report["probe_accounting"]["per_host_probe_cap"] == 1
+        assert report["probe_accounting"]["per_row_probe_cap"] == 1
+        assert "per_host_probe_cap" not in report["probe_accounting"]
         assert runner.max_inflight <= 3
         by_ip = {}
         for argv in probes:
@@ -685,12 +694,14 @@ def test_ssh_cipher_and_hostkey_and_tls_certificate_findings():
     )
     assert status == "observed_no_weakness", err
     triple = xml("").replace("ECDHE-RSA-AES128-GCM-SHA256", "DES-CBC3-SHA")
-    status, _observations, _snippet, err = nc.parse_tls_output(triple, NOW)
-    assert status == "observed_no_weakness", err
+    status, observations, _snippet, err = nc.parse_tls_output(triple, NOW)
+    assert status == "observed_weakness", err
+    des = next(item for item in observations if item["id"] == "tls-3des")
+    assert des["severity"] == "medium" and "SWEET32" in des["remediation"]
     tls11 = xml("").replace('version="1.1" enabled="0"', 'version="1.1" enabled="1"')
     status, observations, _snippet, err = nc.parse_tls_output(tls11, NOW)
-    assert status == "lead", err
-    assert any(item["id"] == "tls-1.1" and item["severity"] == "low" for item in observations)
+    assert status == "observed_weakness", err
+    assert any(item["id"] == "tls-1.1" and item["severity"] == "high" for item in observations)
 
 
 def test_signal_handler_and_subprocess_sigterm_drains_one_probe():
@@ -777,6 +788,74 @@ raise SystemExit(0)
         assert done[0]["status"] == "observed_no_weakness"
 
 
+def test_cctld_cname_is_third_party_and_plain_aaaa_stays_authorized():
+    assert nc.registrable_domain("vpn.client.co.uk") == hx.registrable_domain("vpn.client.co.uk") == "client.co.uk"
+    assert nc.registrable_domain("vpn.client.com.au") == "client.com.au"
+    assert nc.cname_is_third_party("vpn.client.co.uk", ["evilcdn.attacker.co.uk"]) is True
+    assert nc.cname_is_third_party("vpn.client.co.uk", ["cdn.client.co.uk"]) is False
+    assert nc.cname_is_third_party("vpn.client.com.au", ["evilcdn.attacker.com.au"]) is True
+    assert nc.cname_is_third_party("vpn.client.com.au", ["cdn.client.com.au"]) is False
+    assert nc.cname_is_third_party("vpn.client.co.jp", ["cdn.other.co.jp"]) is True
+    assert nc.cname_is_third_party("vpn.client.org.uk", ["www.client.org.uk"]) is False
+    scope = nc.NarrowScope(names=[nc.ScopeName("vpn.client.co.uk", "authorize")])
+    leaked = nc.classify_resolution(scope.names[0], {
+        "a": ["198.51.100.9"], "aaaa": [], "cnames": ["evilcdn.attacker.co.uk"],
+        "queried_at": "2026-11-11T00:00:00Z", "error": "", "cname_unknown": False,
+    }, scope)
+    assert leaked["flagged"] == "third_party_cname"
+    assert leaked["authorizes"] is False
+    assert nc.address_authorized("198.51.100.9", scope, [leaked]) is False
+    same_org = nc.classify_resolution(scope.names[0], {
+        "a": [IP], "aaaa": [], "cnames": ["cdn.client.co.uk"],
+        "queried_at": "2026-11-11T00:00:00Z", "error": "", "cname_unknown": False,
+    }, scope)
+    assert same_org["authorizes"] is True
+    # A plain answer with no CNAME is still authorized by '+', including off the explicit networks.
+    plain = nc.classify_resolution(nc.ScopeName("app.client.example", "authorize"), {
+        "a": [OUTSIDE], "aaaa": [], "cnames": [],
+        "queried_at": "2026-11-11T00:00:00Z", "error": "", "cname_unknown": False,
+    }, nc.NarrowScope())
+    assert plain["authorizes"] is True
+    assert plain["flagged"] == ""
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        runner = ScriptRunner()
+        report = run(
+            tmp, "ssh 198.51.100.9 22\n", "+vpn.client.co.uk\n", "198.51.100.9:22\n",
+            runner=runner,
+            resolver=lambda _name: {
+                "a": ["198.51.100.9"], "aaaa": [], "cnames": ["evilcdn.attacker.co.uk"],
+                "queried_at": "2026-11-11T00:00:00Z",
+            },
+            limits=nc.NarrowLimits(rate_interval=0),
+        )
+        assert report["refused"] is True
+        assert report["dns"]["resolutions"][0]["flagged"] == "third_party_cname"
+        assert runner.calls == []
+        assert not (tmp / "out").exists()
+
+
+def test_same_ip_on_two_rows_is_two_probes():
+    manifest = f"ssh {IP} 22\ntls {IP} 443\n"
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        runner = ScriptRunner()
+        report = run(
+            tmp, manifest, f"{IP}\n", f"{IP}:22\n{IP}:443\n",
+            runner=runner, limits=nc.NarrowLimits(workers=2, rate_interval=0),
+        )
+        assert len(runner.probes()) == 2
+        assert report["probe_accounting"]["rows"] == 2
+        assert report["probe_accounting"]["probes_started"] == 2
+        assert report["probe_accounting"]["per_row_probe_cap"] == 1
+        assert "per_host_probe_cap" not in report["probe_accounting"]
+        by_port = {}
+        for argv in runner.probes():
+            port = argv[argv.index("-p") + 1] if "-p" in argv else "443"
+            by_port[port] = by_port.get(port, 0) + 1
+        assert by_port.get("22") == 1
+
+
 def test_dry_run_subprocess_makes_no_socket():
     guard = r"""
 import os, socket, subprocess, shutil
@@ -837,7 +916,7 @@ subprocess.run = run
 
 def main() -> int:
     tests = [
-        test_load_narrow_scope_still_accepts_documentation_prefix_without_caps,
+        test_load_narrow_scope_uses_the_same_caps_as_a_run,
         test_slash_zero_and_broad_cidrs_fail_closed,
         test_address_cap_counts_prefix_legal_networks,
         test_malformed_scope_fails_before_resolver_or_directory,
@@ -853,6 +932,8 @@ def main() -> int:
         test_unreachable_is_not_a_negative_and_timeouts_are_configurable,
         test_ssh_cipher_and_hostkey_and_tls_certificate_findings,
         test_signal_handler_and_subprocess_sigterm_drains_one_probe,
+        test_cctld_cname_is_third_party_and_plain_aaaa_stays_authorized,
+        test_same_ip_on_two_rows_is_two_probes,
         test_dry_run_subprocess_makes_no_socket,
     ]
     failed = 0

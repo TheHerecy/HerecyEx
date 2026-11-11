@@ -40,9 +40,10 @@ DNS_POLICY = (
     "A plain FQDN in the narrow scope is resolved and recorded. It does not authorize any address. "
     "An address is probed only when the manifest names that IP, --admit lists that IP:port, and the IP "
     "is inside an included bare IP or canonical CIDR and is not excluded. "
-    "A leading '+' on an FQDN authorizes that name's current A and AAAA answers, except when any CNAME "
-    "in the chain has a different registrable domain (the last two labels). Those third-party names, "
-    "including CDNs and SaaS, are flagged and are not probed. "
+    "A leading '+' on an FQDN authorizes that name's current A and AAAA answers. A plain A or AAAA "
+    "with no CNAME is authorized even when the address is shared infrastructure; prefer an explicit "
+    "IP or CIDR for those names. A CNAME whose registrable domain differs is third-party, including "
+    "CDNs and SaaS, and is flagged and not probed. "
     "A leading '++' is the explicit per-name override that authorizes the current answers even across "
     "a third-party CNAME. Exclusions still win. 0.0.0.0/0 and ::/0 are never accepted. "
     "Immediately before a probe that '+' or '++' authorized, the name is resolved again. If the address "
@@ -51,7 +52,9 @@ DNS_POLICY = (
     "A DNS change does not cancel an explicit IP or CIDR authorization; the new answers are only recorded. "
     "A resolver that cannot show the CNAME chain (the getaddrinfo fallback) cannot satisfy '+' or '++'; "
     "those names are flagged cname_chain_unknown. "
-    "Registrable-domain comparison is the last two labels, not the Public Suffix List. "
+    "Registrable domain is the workflow eTLD+1 table (co.uk, com.au, co.jp, and the other two-part "
+    "suffixes in that table), not the full Public Suffix List. A suffix that is not in the table uses "
+    "the last two labels. "
     "--dry-run does not resolve and does not contact the network."
 )
 
@@ -273,17 +276,14 @@ def _prefix_floor(net: ipaddress._BaseNetwork, limits: NarrowLimits) -> int:
 def parse_narrow_scope(
     path: Path,
     limits: Optional[NarrowLimits] = None,
-    *,
-    enforce_caps: bool = True,
 ) -> NarrowScope:
-    """Parse a narrow scope file. Fail closed on malformed or forbidden lines.
+    """Parse a narrow scope file. Fail closed on malformed, forbidden, or over-broad lines.
 
-    ``enforce_caps=False`` is only for ``load_narrow_scope``, which older tests
-    use as a network list. ``/0`` is still refused. The run path enforces caps.
+    Prefix floors and the address cap always apply. There is no uncapped entry point.
+    ``/0`` is refused even when the prefix floor is lifted.
     """
     limits = limits or NarrowLimits()
-    if enforce_caps:
-        limits.validate()
+    limits.validate()
     includes: list = []
     excludes: list = []
     names: list[ScopeName] = []
@@ -333,7 +333,7 @@ def parse_narrow_scope(
             if net.prefixlen == 0:
                 errors.append(f"line {lineno}: prefix /0 is refused outright ({line!r})")
                 continue
-            if enforce_caps and not limits.allow_broad_cidr and net.prefixlen < _prefix_floor(net, limits):
+            if not limits.allow_broad_cidr and net.prefixlen < _prefix_floor(net, limits):
                 floor = _prefix_floor(net, limits)
                 errors.append(
                     f"line {lineno}: CIDR {line!r} is broader than the /{floor} prefix floor; "
@@ -366,37 +366,35 @@ def parse_narrow_scope(
         names.append(ScopeName(fqdn, name_mode))
     if errors:
         _scope_error(errors)
-    if enforce_caps:
-        total = 0
-        for net in includes:
-            total += int(net.num_addresses)
-            if total > limits.max_addresses:
-                raise NarrowInputError(
-                    "scope file rejected. "
-                    f"included networks sum to at least {total} addresses, over "
-                    f"--narrow-max-addresses {limits.max_addresses}"
-                )
+    total = 0
+    for net in includes:
+        total += int(net.num_addresses)
+        if total > limits.max_addresses:
+            raise NarrowInputError(
+                "scope file rejected. "
+                f"included networks sum to at least {total} addresses, over "
+                f"--narrow-max-addresses {limits.max_addresses}"
+            )
     return NarrowScope(networks=includes, excluded_nets=excludes, names=names)
 
 
-def load_narrow_scope(path: Path) -> list:
-    """Bare IPs and canonical CIDRs. Host bits are not masked.
+def load_narrow_scope(path: Path, limits: Optional[NarrowLimits] = None) -> list:
+    """Included networks from a narrow scope file, with the same caps as a run.
 
     A bare IP is that host (/32 or /128). A CIDR is accepted only when
     ``ipaddress.ip_network(line, strict=True)`` accepts it, so the written
     address is already the network address. ``203.0.113.10/0`` and
     ``203.0.113.10/24`` are rejected. They are not rewritten to
     ``0.0.0.0/0`` or ``203.0.113.0/24``. ``0.0.0.0/0`` and ``::/0`` are refused.
-
-    This wrapper does not apply the run-path prefix floor or address cap, so a
-    documentation prefix such as ``2001:db8::/32`` still loads here. ``run_manifest``
-    uses ``parse_narrow_scope`` and does enforce those caps.
+    The default prefix floor and address cap apply. Pass ``limits`` only to use
+    the same explicit override a run would use (``--narrow-allow-broad-cidr``
+    still cannot admit ``/0``, and the address cap still applies).
 
     The broad recon loader still uses strict=False. A domain suffix is not a
-    network and does not admit an address. Valid FQDNs are kept by the run-path
-    parser and are not part of this network list.
+    network and does not admit an address. Valid FQDNs are kept by the parser
+    and are not part of this network list.
     """
-    return parse_narrow_scope(path, enforce_caps=False).networks
+    return parse_narrow_scope(path, limits).networks
 
 
 def _unique_ips(values: Iterable[str]) -> list[str]:
@@ -414,11 +412,12 @@ def _unique_ips(values: Iterable[str]) -> list[str]:
 
 
 def registrable_domain(name: str) -> str:
-    """Last two labels. This is not a Public Suffix List lookup."""
-    labels = [part for part in name.rstrip(".").lower().split(".") if part]
-    if len(labels) < 2:
-        return ".".join(labels)
-    return ".".join(labels[-2:])
+    """eTLD+1 from the workflow suffix table, including co.uk and com.au.
+
+    This is not the full Public Suffix List. A suffix absent from that table
+    falls back to the last two labels.
+    """
+    return hx.registrable_domain(name)
 
 
 def cname_is_third_party(query: str, cnames: Iterable[str]) -> bool:
@@ -996,35 +995,36 @@ def parse_tls_output(xml_text: str, now: datetime) -> tuple[str, list[dict[str, 
             })
             continue
         weak_version = (
-            (ptype == "tls" and version == "1.0")
+            (ptype == "tls" and version in {"1.0", "1.1"})
             or (ptype == "ssl" and version in {"2", "3"})
         )
         if enabled == "1" and weak_version:
+            if version == "1.0":
+                proto_id = "tls-1.0"
+            elif version == "1.1":
+                proto_id = "tls-1.1"
+            else:
+                proto_id = f"tls-{ptype}{version}"
             observations.append({
-                "id": "tls-1.0" if version == "1.0" else f"tls-{ptype}{version}",
+                "id": proto_id,
                 "status": "observed_weakness",
                 "severity": "high",
                 "evidence": line,
-                "remediation": "Disable SSLv2, SSLv3, and TLS 1.0 on this listener.",
-            })
-        elif enabled == "1" and ptype == "tls" and version == "1.1":
-            observations.append({
-                "id": "tls-1.1",
-                "status": "lead",
-                "severity": "low",
-                "evidence": line,
-                "remediation": "TLS 1.1 is deprecated. Prefer TLS 1.2 or 1.3.",
+                "remediation": "Disable SSLv2, SSLv3, TLS 1.0, and TLS 1.1 on this listener.",
             })
 
     weak_ciphers = []
+    triple_des = []
     for cipher in ciphers:
         status = (cipher.get("status") or "").lower()
         name = cipher.get("cipher") or ""
         if status not in {"accepted", "preferred"}:
             continue
+        evidence = f'{status} {cipher.get("sslversion") or ""} {name}'.strip()
         if WEAK_CIPHER.search(name):
-            evidence = f'{status} {cipher.get("sslversion") or ""} {name}'.strip()
             weak_ciphers.append(evidence)
+        elif re.search(r"DES-CBC3|3DES", name, re.I):
+            triple_des.append(evidence)
     if weak_ciphers:
         observations.append({
             "id": "tls-cipher",
@@ -1034,6 +1034,18 @@ def parse_tls_output(xml_text: str, now: datetime) -> tuple[str, list[dict[str, 
             "remediation": "Disable NULL, anonymous, export, RC4, and single-DES cipher suites.",
         })
         snippet_lines.extend(weak_ciphers[:8])
+    if triple_des:
+        observations.append({
+            "id": "tls-3des",
+            "status": "observed_weakness",
+            "severity": "medium",
+            "evidence": "; ".join(triple_des[:8]),
+            "remediation": (
+                "Disable 3DES cipher suites. 3DES is vulnerable to SWEET32 (CVE-2016-2183). "
+                "Prefer AEAD suites such as AES-GCM or ChaCha20-Poly1305."
+            ),
+        })
+        snippet_lines.extend(triple_des[:8])
 
     if not ciphers:
         observations.append({
@@ -1085,12 +1097,13 @@ def parse_tls_output(xml_text: str, now: datetime) -> tuple[str, list[dict[str, 
             "evidence": f"{len(ciphers)} cipher element(s), no NULL/anonymous/export/RC4/single-DES accepted",
             "remediation": "",
         })
-    if not any(item["status"] == "observed_weakness" and item["id"].startswith("tls-") and "cipher" not in item["id"] and "expiry" not in item["id"] for item in observations):
-        if not any(item["status"] == "error" and item["id"].startswith("tls-protocol") for item in observations):
+    protocol_weak = {"tls-1.0", "tls-1.1", "tls-ssl2", "tls-ssl3"}
+    if not any(item["id"] in protocol_weak and item["status"] == "observed_weakness" for item in observations):
+        if not any(item["status"] == "error" and str(item["id"]).startswith("tls-protocol") for item in observations):
             observations.append({
                 "id": "tls-protocol",
                 "status": "observed_no_weakness",
-                "evidence": "SSLv2, SSLv3, and TLS 1.0 are not enabled in the XML",
+                "evidence": "SSLv2, SSLv3, TLS 1.0, and TLS 1.1 are not enabled in the XML",
                 "remediation": "",
             })
     return _tls_overall(observations), observations, "\n".join(snippet_lines)[:1200], ""
@@ -1328,8 +1341,9 @@ TLS_LIMITATION = (
     "--no-fallback --no-groups --show-certificate --connect-timeout=10 --timeout=5 --xml=FILE IP:PORT. "
     "Those --no-* switches are present in the rbsec sslscan 2.1.5 source. testssl is not invoked. "
     "No --sni-name is set. sslscan XML is the TLS evidence. "
-    "TLS 1.0, SSLv2, and SSLv3 enabled=1 in XML are weaknesses. TLS 1.1 is only a lead. "
-    "Accepted NULL, anonymous, export, RC4, and single-DES suites are weaknesses; 3DES (DES-CBC3) and AES-CBC are not. "
+    "TLS 1.0, TLS 1.1, SSLv2, and SSLv3 enabled=1 in XML are weaknesses. "
+    "Accepted NULL, anonymous, export, RC4, and single-DES suites are weaknesses. "
+    "Accepted 3DES (DES-CBC3) is a medium finding (SWEET32). AES-CBC is not classified from the cipher name. "
     "Certificate expiry uses not-valid-after against the checker clock. A missing or unparsed date is error. "
     "Self-signed, MD5 or SHA-1 signatures, and short keys are weaknesses only when those XML elements are present. "
     "Their absence is not a negative result. "
@@ -1848,7 +1862,7 @@ def run_manifest(
     active_limits = limits or NarrowLimits()
     try:
         active_limits.validate()
-        scope = parse_narrow_scope(scope_file, active_limits, enforce_caps=True)
+        scope = parse_narrow_scope(scope_file, active_limits)
         admitted = parse_admit(admit_file)
     except NarrowInputError as exc:
         # No output directory and no tool. Bad admit used to raise SystemExit.
@@ -1963,10 +1977,11 @@ def _success_report(
         "interrupted": interrupted,
         "budgets": BUDGETS,
         "probe_accounting": {
-            "hosts": len(results),
+            "rows": len(results),
             "probes_started": probes,
             "workers": workers,
-            "per_host_probe_cap": 1,
+            # One probe per manifest row that starts. Two rows for one IP are two probes.
+            "per_row_probe_cap": 1,
         },
         "limitations": {
             "tls": TLS_LIMITATION,

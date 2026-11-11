@@ -128,7 +128,11 @@ def test_tls_positive_and_hardened():
 
     with tempfile.TemporaryDirectory() as raw:
         triple, _ = run_one(Path(raw), "tls", 443, tls_xml(cipher="DES-CBC3-SHA"))
-    assert triple["status"] == "observed_no_weakness", triple
+    assert triple["status"] == "observed_weakness", triple
+    assert "tls-3des" in ids(triple)
+    des = next(item for item in triple["observations"] if item["id"] == "tls-3des")
+    assert des["severity"] == "medium"
+    assert "SWEET32" in des["remediation"]
 
     with tempfile.TemporaryDirectory() as raw:
         rejected, _ = run_one(Path(raw), "tls", 443, tls_xml(cipher="RC4-SHA", cipher_status="rejected"))
