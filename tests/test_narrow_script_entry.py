@@ -52,6 +52,8 @@ ALLOWED = {
     "--narrow-min-prefix-v6",
     "--narrow-max-addresses",
     "--narrow-allow-broad-cidr",
+    "--narrow-resolver",
+    "--narrow-allow-resolver",
 }
 
 GUARD = r"""

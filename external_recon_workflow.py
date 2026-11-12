@@ -4191,7 +4191,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "Not enabled by --quick. Recon flags are refused. Narrow scope flags "
                         "(--dry-run, --narrow-workers, --narrow-rate, --narrow-connect-timeout, "
                         "--narrow-host-timeout, --narrow-min-prefix-v4, --narrow-min-prefix-v6, "
-                        "--narrow-max-addresses, --narrow-allow-broad-cidr) are accepted.")
+                        "--narrow-max-addresses, --narrow-allow-broad-cidr, "
+                        "--narrow-resolver, --narrow-allow-resolver) are accepted.")
     p.add_argument("--manifest", metavar="FILE",
                    help="Narrow-check rows: tls|ssh|smb IP PORT. Used only with --narrow-checks.")
     p.add_argument("--admit", metavar="FILE",
@@ -4214,6 +4215,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Narrow checks: refuse when included networks sum past this many addresses (default: 1024).")
     p.add_argument("--narrow-allow-broad-cidr", action="store_true",
                    help="Narrow checks: lift the prefix floor. Does not allow /0 and does not lift the address cap.")
+    p.add_argument("--narrow-resolver", action="append", default=None,
+                   help="Narrow checks: DNS server IP for scope names. Repeat or separate with commas. "
+                        "The IP must be inside explicit scope, or named again with --narrow-allow-resolver.")
+    p.add_argument("--narrow-allow-resolver", action="append", default=None,
+                   help="Narrow checks: allow DNS queries to this IP when it is outside the scope file.")
     p.add_argument("--version", action="version", version=f"HerecyEx {__version__}")
     return p
 
@@ -4385,6 +4391,7 @@ _NARROW_VALUE_OPTIONS = {
     "--manifest", "--scope-check", "--admit", "--output", "-o",
     "--narrow-workers", "--narrow-rate", "--narrow-connect-timeout", "--narrow-host-timeout",
     "--narrow-min-prefix-v4", "--narrow-min-prefix-v6", "--narrow-max-addresses",
+    "--narrow-resolver", "--narrow-allow-resolver",
 }
 
 
@@ -4470,7 +4477,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "--manifest, --scope-check, --admit, --authorized, -o/--output, "
                 "--dry-run, --narrow-workers, --narrow-rate, --narrow-connect-timeout, "
                 "--narrow-host-timeout, --narrow-min-prefix-v4, --narrow-min-prefix-v6, "
-                "--narrow-max-addresses, and --narrow-allow-broad-cidr. Refusing "
+                "--narrow-max-addresses, --narrow-allow-broad-cidr, "
+                "--narrow-resolver, and --narrow-allow-resolver. Refusing "
                 + ", ".join(conflicts)
                 + ".",
                 file=sys.stderr,

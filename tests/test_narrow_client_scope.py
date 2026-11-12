@@ -7,6 +7,7 @@ Tool output is a string. Documentation addresses only (RFC 5737 / RFC 3849).
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import signal
@@ -856,6 +857,171 @@ def test_same_ip_on_two_rows_is_two_probes():
         assert by_port.get("22") == 1
 
 
+def test_no_tls_handshake_is_not_a_pass_or_a_tool_error():
+    quiet = """<?xml version="1.0" encoding="UTF-8"?>
+<document title="SSLScan Results" version="2.1.5">
+ <ssltest host="203.0.113.10" port="636">
+  <protocol type="ssl" version="2" enabled="0" />
+  <protocol type="ssl" version="3" enabled="0" />
+  <protocol type="tls" version="1.0" enabled="0" />
+  <protocol type="tls" version="1.1" enabled="0" />
+  <protocol type="tls" version="1.2" enabled="0" />
+  <protocol type="tls" version="1.3" enabled="0" />
+ <certificates>
+ </certificates>
+ </ssltest>
+</document>
+"""
+    status, observations, _snippet, err = nc.parse_tls_output(quiet, NOW, port=636)
+    assert status == "no_tls_handshake", (status, err)
+    assert status != "observed_no_weakness"
+    assert "no certificate" in err.lower() or "No TLS protocol" in err
+    assert "LDAPS" in err
+    assert "SECLEVEL" in err
+    assert "sslscan" in err
+    assert observations[0]["status"] == "no_tls_handshake"
+    assert observations[0]["remediation"]
+    negotiated = quiet.replace('version="1.2" enabled="0"', 'version="1.2" enabled="1"')
+    status, _observations, _snippet, err = nc.parse_tls_output(negotiated, NOW, port=636)
+    assert status == "error", (status, err)
+    assert "not-valid-after" in err
+    assert status != "no_tls_handshake"
+    status, _observations, _snippet, err = nc.parse_tls_output("this is not xml", NOW)
+    assert status == "error"
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        runner = ScriptRunner()
+        runner.stdout = quiet
+        report = run(
+            tmp, f"tls {IP} 636\n", f"{IP}\n", f"{IP}:636\n",
+            runner=runner, limits=nc.NarrowLimits(rate_interval=0),
+        )
+        row = report["results"][0]
+        assert row["status"] == "no_tls_handshake"
+        assert row["status"] != "observed_no_weakness"
+        assert row["provenance"]["exit_code"] == 0
+        counts = {}
+        for item in report["results"]:
+            counts[item["status"]] = counts.get(item["status"], 0) + 1
+        assert counts == {"no_tls_handshake": 1}
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+
+        class BadExit(ScriptRunner):
+            def run(self, argv, timeout):
+                completed = super().run(argv, timeout)
+                if "-V" in argv or "--version" in argv:
+                    return completed
+                return nc.Completed(completed.argv, 2, quiet, "", False, "t0", "t1")
+
+        report = run(
+            tmp, f"tls {IP} 636\n", f"{IP}\n", f"{IP}:636\n",
+            runner=BadExit(), limits=nc.NarrowLimits(rate_interval=0),
+        )
+        assert report["results"][0]["status"] == "error"
+        assert "tool error" in report["results"][0]["provenance"]["error"]
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+
+        class Timed(ScriptRunner):
+            def run(self, argv, timeout):
+                completed = super().run(argv, timeout)
+                if "-V" in argv or "--version" in argv:
+                    return completed
+                return nc.Completed(completed.argv, 0, quiet, "", True, "t0", "t1")
+
+        report = run(
+            tmp, f"tls {IP} 636\n", f"{IP}\n", f"{IP}:636\n",
+            runner=Timed(), limits=nc.NarrowLimits(rate_interval=0),
+        )
+        assert report["results"][0]["status"] == "error"
+        assert report["results"][0]["provenance"]["timed_out"] is True
+
+
+def test_narrow_resolver_is_fail_closed_and_recorded():
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        manifest, scope, admit = write_files(tmp, f"ssh {IP} 22\n", f"{IP}\n", f"{IP}:22\n")
+        out = tmp / "out"
+        runner = Boom()
+        hx._NARROW_RUNNER = runner
+        try:
+            code = hx.main([
+                "--narrow-checks", "--manifest", str(manifest), "--scope-check", str(scope),
+                "--admit", str(admit), "--authorized", "-o", str(out),
+                "--narrow-resolver", "dns.example",
+            ])
+        finally:
+            hx._NARROW_RUNNER = None
+        assert code == 2
+        assert runner.calls == []
+        assert not out.exists()
+    limits = nc.limits_from_args(argparse.Namespace(
+        narrow_workers=2, narrow_rate=0, narrow_connect_timeout=10, narrow_host_timeout=0,
+        narrow_min_prefix_v4=24, narrow_min_prefix_v6=120, narrow_max_addresses=1024,
+        narrow_allow_broad_cidr=False,
+        narrow_resolver=["203.0.113.10,203.0.113.11"],
+        narrow_allow_resolver=None,
+    ))
+    assert limits.resolvers == ("203.0.113.10", "203.0.113.11")
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        called = []
+        report = run(
+            tmp, f"ssh {IP} 22\nvpn.client.example is not a row\n".replace(
+                "vpn.client.example is not a row\n", ""
+            ),
+            f"{IP}\n", f"{IP}:22\n",
+            runner=ScriptRunner(),
+            resolver=Boom(),
+            limits=nc.NarrowLimits(rate_interval=0, resolvers=(OUTSIDE,)),
+            dry_run=True,
+        )
+        assert report.get("dry_run") is not True or report["refused"] is True
+        assert "outside explicit scope" in report["error"]
+        assert called == []
+        assert not (tmp / "out").exists()
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        asked = []
+
+        def query_server(server, name, rtype):
+            asked.append((server, name, rtype))
+            assert server == IP
+            if rtype == "CNAME" and name == "vpn.client.example":
+                return ["cdn.client.example"]
+            if rtype == "CNAME":
+                return []
+            if rtype == "A" and name == "vpn.client.example":
+                return [IP]
+            if rtype == "AAAA":
+                return []
+            raise LookupError("nxdomain")
+
+        report = run(
+            tmp, f"ssh {IP} 22\n", f"{IP}\nvpn.client.example\n", f"{IP}:22\n",
+            runner=ScriptRunner(),
+            resolver=nc.explicit_resolver([IP], query_server=query_server),
+            limits=nc.NarrowLimits(rate_interval=0, resolvers=(IP,)),
+        )
+        saved = report["dns"]["resolutions"][0]
+        assert saved["resolver"] == IP
+        assert saved["cnames"] == ["cdn.client.example"]
+        assert saved["authorizes"] is False
+        assert any(item[0] == IP for item in asked)
+        assert report["limits"]["resolvers"] == [IP]
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        report = run(
+            tmp, f"ssh {IP} 22\n", f"{IP}\nvpn.client.example\n", f"{IP}:22\n",
+            runner=ScriptRunner(),
+            resolver=nc.explicit_resolver([OUTSIDE], query_server=lambda *_args: []),
+            limits=nc.NarrowLimits(rate_interval=0, resolvers=(OUTSIDE,), allow_resolvers=(OUTSIDE,)),
+        )
+        assert report["dns"]["resolutions"][0]["resolver"] == OUTSIDE
+        assert report["refused"] is False
+
+
 def test_dry_run_subprocess_makes_no_socket():
     guard = r"""
 import os, socket, subprocess, shutil
@@ -935,6 +1101,8 @@ def main() -> int:
         test_cctld_cname_is_third_party_and_plain_aaaa_stays_authorized,
         test_same_ip_on_two_rows_is_two_probes,
         test_dry_run_subprocess_makes_no_socket,
+        test_no_tls_handshake_is_not_a_pass_or_a_tool_error,
+        test_narrow_resolver_is_fail_closed_and_recorded,
     ]
     failed = 0
     for fn in tests:

@@ -32,7 +32,7 @@ from xml.etree import ElementTree
 
 import external_recon_workflow as hx
 
-CHECKS_VERSION = "1.2.0"
+CHECKS_VERSION = "1.3.0"
 SCHEMA_VERSION = "1"
 
 # Canonical policy text copied into every report. README summarizes the same rules.
@@ -55,7 +55,10 @@ DNS_POLICY = (
     "Registrable domain is the workflow eTLD+1 table (co.uk, com.au, co.jp, and the other two-part "
     "suffixes in that table), not the full Public Suffix List. A suffix that is not in the table uses "
     "the last two labels. "
-    "--dry-run does not resolve and does not contact the network."
+    "--dry-run does not resolve and does not contact the network. "
+    "--narrow-resolver sends A, AAAA, and CNAME lookups for scope names to those IPs only. "
+    "Each resolver must be inside explicit scope or named with --narrow-allow-resolver. "
+    "The report records which resolver answered. Without the flag, resolution uses the system resolver."
 )
 
 SCOPE_POLICY = (
@@ -83,6 +86,7 @@ STATUSES = (
     "lead",
     "not_tested",
     "unreachable",
+    "no_tls_handshake",
     "error",
 )
 
@@ -181,6 +185,13 @@ def redact(text: str) -> str:
     return text
 
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI.sub("", text).strip()
+
+
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
 
@@ -191,6 +202,31 @@ class NarrowInputError(Exception):
     def __init__(self, message: str) -> None:
         super().__init__(message)
         self.message = message
+
+
+def _normalize_ip_list(values: Iterable[str], flag: str) -> tuple[str, ...]:
+    """Canonical IPs. A hostname, CIDR, or empty token is a hard error."""
+    found: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        text = str(value).strip()
+        if not text:
+            continue
+        try:
+            ip = str(ipaddress.ip_address(text))
+        except ValueError:
+            raise NarrowInputError(f"{flag} must be an IP address, not {text!r}") from None
+        if ip not in seen:
+            seen.add(ip)
+            found.append(ip)
+    return tuple(found)
+
+
+def _split_ip_tokens(values: Optional[Iterable[str]]) -> list[str]:
+    parts: list[str] = []
+    for value in values or []:
+        parts.extend(piece.strip() for piece in str(value).split(","))
+    return [piece for piece in parts if piece]
 
 
 @dataclass
@@ -205,6 +241,8 @@ class NarrowLimits:
     min_prefix_v6: int = 120
     max_addresses: int = 1024
     allow_broad_cidr: bool = False
+    resolvers: tuple[str, ...] = ()
+    allow_resolvers: tuple[str, ...] = ()
 
     def validate(self) -> None:
         if self.workers < 1:
@@ -221,6 +259,8 @@ class NarrowLimits:
             raise NarrowInputError("--narrow-min-prefix-v6 must be an integer 0-128")
         if self.max_addresses < 1:
             raise NarrowInputError("--narrow-max-addresses must be an integer >= 1")
+        _normalize_ip_list(self.resolvers, "--narrow-resolver")
+        _normalize_ip_list(self.allow_resolvers, "--narrow-allow-resolver")
 
 
 @dataclass(frozen=True)
@@ -448,7 +488,7 @@ def _call_resolver(resolver: Callable[[str], dict[str, Any]], name: str) -> dict
     a = _unique_ips(raw.get("a") or [])
     aaaa = _unique_ips(raw.get("aaaa") or [])
     cnames = [str(item).rstrip(".").lower() for item in (raw.get("cnames") or []) if str(item).strip()]
-    return {
+    result = {
         "name": name,
         "queried_at": str(raw.get("queried_at") or _now_iso()),
         "a": a,
@@ -456,7 +496,11 @@ def _call_resolver(resolver: Callable[[str], dict[str, Any]], name: str) -> dict
         "cnames": cnames,
         "cname_unknown": bool(raw.get("cname_unknown")),
         "error": str(raw.get("error") or ""),
+        "resolver": str(raw.get("resolver") or ""),
     }
+    if raw.get("resolvers"):
+        result["resolvers"] = [str(item) for item in raw["resolvers"]]
+    return result
 
 
 def classify_resolution(entry: ScopeName, raw: dict[str, Any], scope: NarrowScope) -> dict[str, Any]:
@@ -653,13 +697,102 @@ def _dnspython_query(name: str, rtype: str) -> list[str]:
     return values
 
 
+def _empty_resolution(error: str, resolvers_tried: Optional[list[str]] = None) -> dict[str, Any]:
+    return {
+        "a": [],
+        "aaaa": [],
+        "cnames": [],
+        "cname_unknown": False,
+        "error": error,
+        "queried_at": _now_iso(),
+        "resolver": "",
+        "resolvers": list(resolvers_tried or []),
+    }
+
+
+def _dnspython_query_server(name: str, rtype: str, server: str) -> list[str]:
+    """One question to one configured resolver. Does not use the system resolver."""
+    import dns.exception
+    import dns.resolver
+
+    resolver = dns.resolver.Resolver(configure=False)
+    resolver.nameservers = [server]
+    resolver.lifetime = 5.0
+    try:
+        answers = resolver.resolve(name, rtype)
+    except dns.resolver.NXDOMAIN as exc:
+        raise LookupError("nxdomain") from exc
+    except dns.resolver.NoAnswer:
+        return []
+    except dns.exception.DNSException as exc:
+        raise RuntimeError(str(exc)) from exc
+    values = []
+    for rr in answers:
+        text = str(getattr(rr, "target", rr)).rstrip(".")
+        values.append(text)
+    return values
+
+
+def explicit_resolver(
+    servers: Iterable[str],
+    query_server: Optional[Callable[[str, str, str], list[str]]] = None,
+) -> Callable[[str], dict[str, Any]]:
+    """Resolve only through the named servers. The first agreeing answer is kept.
+
+    ``query_server(server, name, rtype)`` is the offline seam. Production uses dnspython.
+    A missing dnspython does not fall back to the system resolver.
+    """
+    chosen = list(servers)
+
+    def resolve(name: str) -> dict[str, Any]:
+        if query_server is None:
+            try:
+                import dns.resolver  # noqa: F401
+            except ImportError:
+                return _empty_resolution(
+                    "dnspython is required for --narrow-resolver; the system resolver was not used",
+                    chosen,
+                )
+        gathered = []
+        for server in chosen:
+            def query(hostname: str, rtype: str, server: str = server) -> list[str]:
+                if query_server is None:
+                    return _dnspython_query_server(hostname, rtype, server)
+                return query_server(server, hostname, rtype)
+
+            found = _resolve_with_query(name, query)
+            found["resolver"] = server
+            gathered.append(found)
+        ok = [item for item in gathered if not item.get("error")]
+        if not ok:
+            detail = "; ".join(f"{item['resolver']}: {item.get('error') or 'no answer'}" for item in gathered)
+            return _empty_resolution(f"no resolver answered ({', '.join(chosen)}). {detail}", chosen)
+        signatures = {
+            (tuple(item.get("a") or []), tuple(item.get("aaaa") or []), tuple(item.get("cnames") or []))
+            for item in ok
+        }
+        if len(signatures) > 1:
+            return _empty_resolution(
+                "resolvers disagreed: " + ", ".join(str(item.get("resolver") or "") for item in ok),
+                [str(item.get("resolver") or "") for item in ok],
+            )
+        result = dict(ok[0])
+        result["resolvers"] = [str(item.get("resolver") or "") for item in ok]
+        return result
+
+    return resolve
+
+
 def default_resolver(name: str) -> dict[str, Any]:
     """dnspython when it is installed, otherwise getaddrinfo (no CNAME chain)."""
     try:
         import dns.resolver  # noqa: F401
     except ImportError:
-        return _resolve_getaddrinfo(name)
-    return _resolve_with_query(name, _dnspython_query)
+        found = _resolve_getaddrinfo(name)
+    else:
+        found = _resolve_with_query(name, _dnspython_query)
+    found["resolver"] = "system"
+    return found
 
 
 def parse_admit(path: Path) -> set[tuple[str, int]]:
@@ -880,7 +1013,15 @@ def _tls_overall(observations: list[dict[str, Any]]) -> str:
 
 
 def _worst(statuses: Iterable[str]) -> str:
-    order = ["error", "unreachable", "not_tested", "observed_weakness", "lead", "observed_no_weakness"]
+    order = [
+        "error",
+        "unreachable",
+        "no_tls_handshake",
+        "not_tested",
+        "observed_weakness",
+        "lead",
+        "observed_no_weakness",
+    ]
     present = set(statuses)
     for item in order:
         if item in present:
@@ -964,7 +1105,56 @@ def _tls_cert_findings(root: ElementTree.Element) -> list[dict[str, Any]]:
     return findings
 
 
-def parse_tls_output(xml_text: str, now: datetime) -> tuple[str, list[dict[str, Any]], str, str]:
+OPENSSL_CLIENT_LIMIT = (
+    "This client cannot offer SSLv3 or TLS 1.0/1.1: Terrifier's OpenSSL 3.6.5 uses MinProtocol TLSv1.2 "
+    "and SECLEVEL 2, and SSL3 is compiled out. sslscan 2.1.5 uses that OpenSSL for the handshake. "
+    "The --no-heartbleed and other --no-* switches do not restore those protocols. "
+    "A service that speaks only TLS 1.0 or SSLv3 can look the same as no TLS."
+)
+
+
+def _certificate_material(root: ElementTree.Element) -> bool:
+    for tag in ("not-valid-after", "not-valid-before", "signature-algorithm", "pk", "pk-bits", "subject", "issuer"):
+        for node in root.iter(tag):
+            if (node.text or "").strip() or node.attrib:
+                return True
+    for node in root.iter("certificate"):
+        if list(node) or (node.text or "").strip():
+            return True
+    return False
+
+
+def _no_tls_handshake(protocols: list, ciphers: list, root: ElementTree.Element) -> bool:
+    """Every listed protocol is disabled, nothing was accepted, and no certificate was parsed."""
+    if not protocols:
+        return False
+    for proto in protocols:
+        enabled = (proto.get("enabled") or "").strip()
+        if enabled != "0":
+            return False
+    for cipher in ciphers:
+        if (cipher.get("status") or "").lower() in {"accepted", "preferred"}:
+            return False
+    return not _certificate_material(root)
+
+
+def _no_tls_reason(port: Optional[int]) -> str:
+    parts = [
+        "No TLS protocol was negotiated and no certificate was presented. "
+        "The port may be open without a TLS service."
+    ]
+    if port == 636:
+        parts.append("On port 636 this often means LDAPS has no certificate installed.")
+    parts.append(OPENSSL_CLIENT_LIMIT)
+    parts.append("This is not a negative crypto result and not a tool failure.")
+    return " ".join(parts)
+
+
+def parse_tls_output(
+    xml_text: str,
+    now: datetime,
+    port: Optional[int] = None,
+) -> tuple[str, list[dict[str, Any]], str, str]:
     """Return status, observations, snippet, error. Incomplete XML is error, not a pass."""
     if not xml_text or not xml_text.strip():
         return "error", [], "", "sslscan XML is empty"
@@ -1046,6 +1236,20 @@ def parse_tls_output(xml_text: str, now: datetime) -> tuple[str, list[dict[str, 
             ),
         })
         snippet_lines.extend(triple_des[:8])
+
+    if _no_tls_handshake(protocols, ciphers, root):
+        evidence = "\n".join(snippet_lines)
+        reason = _no_tls_reason(port)
+        return "no_tls_handshake", [{
+            "id": "tls-handshake",
+            "status": "no_tls_handshake",
+            "severity": "info",
+            "evidence": evidence[:1200],
+            "remediation": (
+                "This is not a clean result. Confirm the listener is supposed to speak TLS "
+                "and, for LDAPS, that a certificate is installed."
+            ),
+        }], evidence[:1200], reason
 
     if not ciphers:
         observations.append({
@@ -1344,10 +1548,14 @@ TLS_LIMITATION = (
     "TLS 1.0, TLS 1.1, SSLv2, and SSLv3 enabled=1 in XML are weaknesses. "
     "Accepted NULL, anonymous, export, RC4, and single-DES suites are weaknesses. "
     "Accepted 3DES (DES-CBC3) is a medium finding (SWEET32). AES-CBC is not classified from the cipher name. "
-    "Certificate expiry uses not-valid-after against the checker clock. A missing or unparsed date is error. "
+    "Certificate expiry uses not-valid-after against the checker clock. A missing or unparsed date is error "
+    "when a protocol negotiated. When every protocol is disabled and no certificate is present, the status "
+    "is no_tls_handshake, which is not a pass and is not a tool error. "
     "Self-signed, MD5 or SHA-1 signatures, and short keys are weaknesses only when those XML elements are present. "
     "Their absence is not a negative result. "
     "The terrifier OpenSSL is 3.6.5 with MinProtocol TLSv1.2, SECLEVEL 2, and SSL3 compiled out. "
+    "sslscan 2.1.5 uses that OpenSSL for the handshake. Its --no-* switches do not restore SSLv3 or TLS 1.0/1.1. "
+    "A legacy-only service can therefore look the same as no TLS. "
     "This sslscan build may be unable to offer TLS 1.0 or SSLv3, so an offline XML fixture is not a live TLS 1.0 result."
 )
 
@@ -1384,12 +1592,15 @@ def _finish_from_parse(
     if completed.timed_out:
         status = "error"
         parse_error = parse_error or "timed out"
+    elif completed.returncode not in {0, None} and status == "no_tls_handshake":
+        status = "error"
+        parse_error = f"exit {completed.returncode} is a tool error, not a missing handshake"
     elif completed.returncode not in {0, None} and status == "observed_no_weakness":
         status = "error"
         parse_error = parse_error or f"exit {completed.returncode} is not a negative result"
     elif status == "error" and not parse_error:
         parse_error = "parse failed"
-    if status in {"observed_weakness", "lead", "unreachable"}:
+    if status in {"observed_weakness", "lead", "unreachable", "no_tls_handshake"}:
         texts = []
         for item in observations:
             text = item.get("remediation") or ""
@@ -1544,6 +1755,21 @@ def _restore_stop(previous: dict[int, Any]) -> None:
             continue
 
 
+def resolver_scope_block(scope: NarrowScope, limits: NarrowLimits) -> Optional[str]:
+    """None when every configured resolver may be queried. No packets are sent."""
+    allowed = set(limits.allow_resolvers)
+    for ip in limits.resolvers:
+        if ip in allowed:
+            continue
+        addr = ipaddress.ip_address(ip)
+        if _addr_in(addr, scope.excluded_nets) or not _addr_in(addr, scope.networks):
+            return (
+                f"DNS resolver {ip} is outside explicit scope; "
+                f"name it with --narrow-allow-resolver {ip} or add it to the scope file"
+            )
+    return None
+
+
 def _limits_payload(limits: NarrowLimits) -> dict[str, Any]:
     return {
         "workers": limits.workers,
@@ -1554,6 +1780,8 @@ def _limits_payload(limits: NarrowLimits) -> dict[str, Any]:
         "min_prefix_v6": limits.min_prefix_v6,
         "max_addresses": limits.max_addresses,
         "allow_broad_cidr": limits.allow_broad_cidr,
+        "resolvers": list(limits.resolvers),
+        "allow_resolvers": list(limits.allow_resolvers),
         "effective_process_timeout": {
             "tls": _process_timeout("tls", limits),
             "ssh": _process_timeout("ssh", limits),
@@ -1614,7 +1842,7 @@ def run_row(
     art.mkdir(parents=True, exist_ok=True)
     safe_ip = ip.replace(":", "_")
     version_run = runner.run(version_argv(check, binary), _version_timeout(active_limits))
-    tool_version = redact((version_run.stdout or version_run.stderr or "").strip().splitlines()[0] if (version_run.stdout or version_run.stderr) else "")
+    tool_version = _strip_ansi(redact((version_run.stdout or version_run.stderr or "").strip().splitlines()[0] if (version_run.stdout or version_run.stderr) else ""))
     if version_run.timed_out:
         return _result(check, ip, port_i, "error", tool=binary_name, tool_version=tool_version, error="version command timed out", timed_out=True, argv=version_run.argv, exit_code=version_run.returncode, started=version_run.started, finished=version_run.finished, dns_recheck=dns_recheck)
     budget = _process_timeout(check, active_limits)
@@ -1627,7 +1855,7 @@ def run_row(
             xml_text = redact(xml_path.read_text(encoding="utf-8", errors="replace"))
         else:
             xml_text = redact(completed.stdout)
-        status, observations, snippet, err = parse_tls_output(xml_text, now)
+        status, observations, snippet, err = parse_tls_output(xml_text, now, port_i)
         if completed.timed_out:
             status, err = "error", "sslscan timed out"
         status, observations, err = _apply_unreachable(
@@ -1864,6 +2092,9 @@ def run_manifest(
         active_limits.validate()
         scope = parse_narrow_scope(scope_file, active_limits)
         admitted = parse_admit(admit_file)
+        blocked = resolver_scope_block(scope, active_limits)
+        if blocked:
+            raise NarrowInputError(blocked)
     except NarrowInputError as exc:
         # No output directory and no tool. Bad admit used to raise SystemExit.
         return _refused_report([
@@ -1907,7 +2138,12 @@ def run_manifest(
     previous = _install_stop(stop) if install_signals else None
     try:
         resolutions: list[dict[str, Any]] = []
-        active_resolver = resolver or default_resolver
+        if resolver is not None:
+            active_resolver = resolver
+        elif active_limits.resolvers:
+            active_resolver = explicit_resolver(active_limits.resolvers)
+        else:
+            active_resolver = default_resolver
         if _needs_resolution(scope) and not stop.is_set():
             resolutions = resolve_scope_names(scope, active_resolver)
         if pending:
@@ -2046,6 +2282,18 @@ def _add_narrow_limit_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--narrow-min-prefix-v6", type=int, default=120, help="Reject IPv6 CIDRs broader than this prefix (default: 120).")
     parser.add_argument("--narrow-max-addresses", type=int, default=1024, help="Refuse when included networks sum past this many addresses (default: 1024).")
     parser.add_argument("--narrow-allow-broad-cidr", action="store_true", help="Lift the prefix floor. Does not allow /0 and does not lift the address cap.")
+    parser.add_argument(
+        "--narrow-resolver",
+        action="append",
+        default=None,
+        help="DNS server IP for scope names. Repeat or use commas. Must be in scope or named with --narrow-allow-resolver.",
+    )
+    parser.add_argument(
+        "--narrow-allow-resolver",
+        action="append",
+        default=None,
+        help="Permit DNS queries to this IP even when it is outside the scope file.",
+    )
 
 
 def limits_from_args(args: argparse.Namespace) -> NarrowLimits:
@@ -2058,6 +2306,11 @@ def limits_from_args(args: argparse.Namespace) -> NarrowLimits:
         min_prefix_v6=args.narrow_min_prefix_v6,
         max_addresses=args.narrow_max_addresses,
         allow_broad_cidr=bool(args.narrow_allow_broad_cidr),
+        resolvers=_normalize_ip_list(_split_ip_tokens(getattr(args, "narrow_resolver", None)), "--narrow-resolver"),
+        allow_resolvers=_normalize_ip_list(
+            _split_ip_tokens(getattr(args, "narrow_allow_resolver", None)),
+            "--narrow-allow-resolver",
+        ),
     )
     limits.validate()
     return limits
