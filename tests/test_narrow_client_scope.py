@@ -1022,6 +1022,112 @@ def test_narrow_resolver_is_fail_closed_and_recorded():
         assert report["refused"] is False
 
 
+def test_resolver_quorum_round_robin_and_exclusions():
+    one = "203.0.113.10"
+    two = "203.0.113.11"
+    target = "198.51.100.9"
+
+    def answers(server, name, rtype, fail=None):
+        if fail and server == fail and rtype == "A":
+            raise TimeoutError("timed out")
+        if rtype == "CNAME" and name == "vpn.client.example":
+            return ["cdn.client.example"]
+        if rtype == "CNAME":
+            return []
+        if rtype == "AAAA":
+            return []
+        if rtype == "A":
+            if server == one:
+                return ["203.0.113.12", "203.0.113.13"]
+            return ["203.0.113.13", "203.0.113.12"]
+        raise LookupError("nxdomain")
+
+    agreed = nc.explicit_resolver([one, two], query_server=lambda server, name, rtype: answers(server, name, rtype))(
+        "vpn.client.example"
+    )
+    assert not agreed["error"], agreed
+    assert set(agreed["a"]) == {"203.0.113.12", "203.0.113.13"}
+    assert agreed["cnames"] == ["cdn.client.example"]
+    assert agreed["resolvers"] == [one, two]
+    scope = nc.NarrowScope(names=[nc.ScopeName("vpn.client.example", "authorize")])
+    assert nc.classify_resolution(scope.names[0], agreed, scope)["authorizes"] is True
+
+    calls = {"slow_a": 0}
+
+    def flaky(server, name, rtype):
+        if rtype == "CNAME":
+            return []
+        if rtype == "AAAA":
+            return []
+        if rtype == "A":
+            if server == two:
+                calls["slow_a"] += 1
+                if calls["slow_a"] >= 2:
+                    raise TimeoutError("timed out")
+            return [target]
+        raise LookupError("nxdomain")
+
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        runner = ScriptRunner()
+        report = run(
+            tmp,
+            f"ssh {target} 22\n",
+            f"{one}\n{two}\n+vpn.client.example\n",
+            f"{target}:22\n",
+            runner=runner,
+            resolver=nc.explicit_resolver([one, two], query_server=flaky),
+            limits=nc.NarrowLimits(rate_interval=0, resolvers=(one, two)),
+        )
+        row = report["results"][0]
+        assert row["status"] == "error"
+        assert row["status"] != "observed_no_weakness"
+        assert "must answer" in row["provenance"]["error"]
+        assert "timed out" in row["provenance"]["error"]
+        assert runner.probes() == []
+
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        asked = []
+
+        def boom(server, name, rtype):
+            asked.append(server)
+            raise TimeoutError("timed out")
+
+        report = run(
+            tmp,
+            f"ssh {target} 22\n",
+            f"{one}\n{two}\n+vpn.client.example\n",
+            f"{target}:22\n",
+            runner=ScriptRunner(),
+            resolver=nc.explicit_resolver([one, two], query_server=boom),
+            limits=nc.NarrowLimits(rate_interval=0, resolvers=(one, two)),
+        )
+        assert report["refused"] is True
+        saved = report["dns"]["resolutions"][0]
+        assert saved["authorizes"] is False
+        assert "must answer" in saved["error"]
+        assert not (tmp / "out").exists()
+
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        asked = []
+        report = run(
+            tmp,
+            f"ssh {one} 22\n",
+            f"203.0.113.0/28\n!{one}\n",
+            f"{one}:22\n",
+            runner=Boom(),
+            resolver=lambda name: asked.append(name),
+            limits=nc.NarrowLimits(rate_interval=0, resolvers=(one,), allow_resolvers=(one,)),
+        )
+        assert report["refused"] is True
+        assert "excluded" in report["error"]
+        assert "exclusion wins" in report["error"]
+        assert asked == []
+        assert not (tmp / "out").exists()
+
+
 def test_dry_run_subprocess_makes_no_socket():
     guard = r"""
 import os, socket, subprocess, shutil
@@ -1103,6 +1209,7 @@ def main() -> int:
         test_dry_run_subprocess_makes_no_socket,
         test_no_tls_handshake_is_not_a_pass_or_a_tool_error,
         test_narrow_resolver_is_fail_closed_and_recorded,
+        test_resolver_quorum_round_robin_and_exclusions,
     ]
     failed = 0
     for fn in tests:

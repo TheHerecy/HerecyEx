@@ -57,8 +57,13 @@ DNS_POLICY = (
     "the last two labels. "
     "--dry-run does not resolve and does not contact the network. "
     "--narrow-resolver sends A, AAAA, and CNAME lookups for scope names to those IPs only. "
-    "Each resolver must be inside explicit scope or named with --narrow-allow-resolver. "
-    "The report records which resolver answered. Without the flag, resolution uses the system resolver."
+    "Each resolver must be inside explicit scope, or named with --narrow-allow-resolver when it is "
+    "merely outside the file. An excluded IP is never a resolver, even if the allow flag names it. "
+    "Every configured resolver must answer, and the answers must agree, before a name is authorized. "
+    "Agreement compares the set of A records, the set of AAAA records, and the CNAME chain. "
+    "A timeout, a failure, or a disagreement leaves the name unauthorized. The same rule is applied "
+    "again immediately before a probe. The report records which resolvers answered. "
+    "Without the flag, resolution uses the system resolver."
 )
 
 SCOPE_POLICY = (
@@ -733,14 +738,24 @@ def _dnspython_query_server(name: str, rtype: str, server: str) -> list[str]:
     return values
 
 
+def _answer_signature(item: dict[str, Any]) -> tuple:
+    """Address sets ignore order. The CNAME chain stays ordered."""
+    return (
+        tuple(sorted(set(item.get("a") or []))),
+        tuple(sorted(set(item.get("aaaa") or []))),
+        tuple(item.get("cnames") or []),
+    )
+
+
 def explicit_resolver(
     servers: Iterable[str],
     query_server: Optional[Callable[[str, str, str], list[str]]] = None,
 ) -> Callable[[str], dict[str, Any]]:
-    """Resolve only through the named servers. The first agreeing answer is kept.
+    """Resolve only through the named servers. Every server must answer and agree.
 
     ``query_server(server, name, rtype)`` is the offline seam. Production uses dnspython.
-    A missing dnspython does not fall back to the system resolver.
+    A missing dnspython does not fall back to the system resolver. A timeout or any other
+    failure from one server leaves the name unauthorized.
     """
     chosen = list(servers)
 
@@ -763,21 +778,25 @@ def explicit_resolver(
             found = _resolve_with_query(name, query)
             found["resolver"] = server
             gathered.append(found)
-        ok = [item for item in gathered if not item.get("error")]
-        if not ok:
-            detail = "; ".join(f"{item['resolver']}: {item.get('error') or 'no answer'}" for item in gathered)
-            return _empty_resolution(f"no resolver answered ({', '.join(chosen)}). {detail}", chosen)
-        signatures = {
-            (tuple(item.get("a") or []), tuple(item.get("aaaa") or []), tuple(item.get("cnames") or []))
-            for item in ok
-        }
+        failed = [item for item in gathered if item.get("error")]
+        if failed or len(gathered) != len(chosen):
+            detail = "; ".join(
+                f"{item.get('resolver')}: {item.get('error') or 'no answer'}" for item in gathered
+            )
+            return _empty_resolution(
+                "every --narrow-resolver must answer before a name is authorized. " + detail,
+                chosen,
+            )
+        signatures = {_answer_signature(item) for item in gathered}
         if len(signatures) > 1:
             return _empty_resolution(
-                "resolvers disagreed: " + ", ".join(str(item.get("resolver") or "") for item in ok),
-                [str(item.get("resolver") or "") for item in ok],
+                "resolvers disagreed: " + ", ".join(str(item.get("resolver") or "") for item in gathered),
+                chosen,
             )
-        result = dict(ok[0])
-        result["resolvers"] = [str(item.get("resolver") or "") for item in ok]
+        result = dict(gathered[0])
+        result["a"] = list(_answer_signature(result)[0])
+        result["aaaa"] = list(_answer_signature(result)[1])
+        result["resolvers"] = [str(item.get("resolver") or "") for item in gathered]
         return result
 
     return resolve
@@ -1675,7 +1694,10 @@ def _dns_recheck(
         records.append(fresh)
         depended = (not explicit) and bool(item.get("authorizes"))
         if depended and (fresh.get("error") or not still or not fresh.get("authorizes")):
-            block = "dns_changed: resolved address changed before the probe"
+            if fresh.get("error"):
+                block = "dns_changed: " + str(fresh["error"])
+            else:
+                block = "dns_changed: resolved address changed before the probe"
     return block, records
 
 
@@ -1756,13 +1778,21 @@ def _restore_stop(previous: dict[int, Any]) -> None:
 
 
 def resolver_scope_block(scope: NarrowScope, limits: NarrowLimits) -> Optional[str]:
-    """None when every configured resolver may be queried. No packets are sent."""
+    """None when every configured resolver may be queried. No packets are sent.
+
+    An exclusion wins over ``--narrow-allow-resolver``. The allow flag only names
+    an address that is outside the scope file, not one the file excluded.
+    """
     allowed = set(limits.allow_resolvers)
     for ip in limits.resolvers:
+        addr = ipaddress.ip_address(ip)
+        if _addr_in(addr, scope.excluded_nets):
+            return (
+                f"DNS resolver {ip} is excluded; an exclusion wins over --narrow-allow-resolver"
+            )
         if ip in allowed:
             continue
-        addr = ipaddress.ip_address(ip)
-        if _addr_in(addr, scope.excluded_nets) or not _addr_in(addr, scope.networks):
+        if not _addr_in(addr, scope.networks):
             return (
                 f"DNS resolver {ip} is outside explicit scope; "
                 f"name it with --narrow-allow-resolver {ip} or add it to the scope file"
@@ -2286,13 +2316,13 @@ def _add_narrow_limit_args(parser: argparse.ArgumentParser) -> None:
         "--narrow-resolver",
         action="append",
         default=None,
-        help="DNS server IP for scope names. Repeat or use commas. Must be in scope or named with --narrow-allow-resolver.",
+        help="DNS server IP for scope names. Repeat or use commas. Must be in scope, or named with --narrow-allow-resolver if it is only outside the file. An excluded IP is refused. Every listed server must answer and agree.",
     )
     parser.add_argument(
         "--narrow-allow-resolver",
         action="append",
         default=None,
-        help="Permit DNS queries to this IP even when it is outside the scope file.",
+        help="Permit DNS queries to this IP when it is outside the scope file. An excluded IP is still refused.",
     )
 
 

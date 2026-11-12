@@ -4217,9 +4217,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Narrow checks: lift the prefix floor. Does not allow /0 and does not lift the address cap.")
     p.add_argument("--narrow-resolver", action="append", default=None,
                    help="Narrow checks: DNS server IP for scope names. Repeat or separate with commas. "
-                        "The IP must be inside explicit scope, or named again with --narrow-allow-resolver.")
+                        "The IP must be inside explicit scope, or named with --narrow-allow-resolver "
+                        "when it is only outside the file. An excluded IP is refused. "
+                        "Every listed server must answer and agree.")
     p.add_argument("--narrow-allow-resolver", action="append", default=None,
-                   help="Narrow checks: allow DNS queries to this IP when it is outside the scope file.")
+                   help="Narrow checks: allow DNS queries to this IP when it is outside the scope file. "
+                        "An excluded IP is still refused.")
     p.add_argument("--version", action="version", version=f"HerecyEx {__version__}")
     return p
 
